@@ -41,7 +41,7 @@ class AnswerGeneratorAgent(BaseAgent):
             template=template
         )
 
-    @with_timeout(30.0)
+    @with_timeout(120.0)
     @with_retry(max_attempts=2)
     async def _process(self, context: AgentContext) -> Dict[str, Any]:
         question = context.original_query or ""

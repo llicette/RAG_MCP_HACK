@@ -246,7 +246,7 @@ class TopicClassifierAgent(BaseAgent):
 
 Отвечай только валидным JSON без дополнительных комментариев."""
     
-    @with_timeout(10.0)
+    @with_timeout(30.0)
     @with_retry(max_attempts=2)
     async def _process(self, context: AgentContext) -> Dict[str, Any]:
         """Основная логика классификации темы"""

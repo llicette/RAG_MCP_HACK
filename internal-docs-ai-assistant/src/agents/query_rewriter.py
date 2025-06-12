@@ -113,11 +113,11 @@ class QueryRewriterAgent(BaseAgent):
 
 Отвечай только валидным JSON."""
     
-    @with_timeout(20.0)
+    @with_timeout(120.0)
     @with_retry(max_attempts=2)
     async def _process(self, context: AgentContext) -> Dict[str, Any]:
         """Основная логика переписывания запроса"""
-        original_query = context.processed_query or context.original_query
+        original_query = context.processed_query or context.original_query or ""
         
         # Предварительная обработка
         preprocessed = self._preprocess_query(original_query)
@@ -156,7 +156,7 @@ class QueryRewriterAgent(BaseAgent):
         try:
             prompt = self.prompt_template.format(
                 original_query=context.original_query,
-                context=context.context or "",
+                context = context.metadata.get("context") or context.topic or "Нет контекста",
                 critic_analysis=critic_analysis
             )
             
@@ -272,7 +272,7 @@ class QueryRewriterAgent(BaseAgent):
         return [word for word in words if word not in stop_words]
     
 # Фабрика для создания агента
-def create_question_critic_agent(config: Dict[str, Any] = None, 
+def create_query_rewriter_agent(config: Dict[str, Any] = None, 
                                 langfuse_client=None) -> QueryRewriterAgent:
     """Фабричная функция для создания агента переписывания запросов"""
     default_config = {

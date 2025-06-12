@@ -211,7 +211,7 @@ class QuestionCriticAgent(BaseAgent):
 
 Отвечай только валидным JSON без дополнительных комментариев."""
     
-    @with_timeout(15.0)
+    @with_timeout(60.0)
     @with_retry(max_attempts=2)
     async def _process(self, context: AgentContext) -> Dict[str, Any]:
         """Основная логика анализа вопроса"""

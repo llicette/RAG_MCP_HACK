@@ -50,7 +50,7 @@ class QualityCheckerAgent(BaseAgent):
             template=template
         )
 
-    @with_timeout(20.0)
+    @with_timeout(60.0)
     @with_retry(max_attempts=2)
     async def _process(self, context: AgentContext) -> Dict[str, Any]:
         """

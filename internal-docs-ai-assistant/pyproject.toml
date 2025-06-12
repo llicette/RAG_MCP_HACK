@@ -4,7 +4,8 @@ version = "0.1.0"
 description = ""
 authors = ["Skillet323 <mr.borgachev@gmail.com>"]
 packages = [
-  { include = "agents", from = "src" }
+  { include = "agents", from = "src" },
+  { include = "core", from = "src" },
 ]
 
 [tool.poetry.dependencies]
@@ -23,6 +24,10 @@ python-magic-bin = "^0.4.14"
 nltk = "^3.9.1"
 beautifulsoup4 = "^4.13.4"
 pandas = "^2.3.0"
+langgraph = "^0.4.8"
+langchain-community = "^0.3.25"
+langchain-huggingface = "^0.3.0"
+langchain-chroma = "^0.2.4"
 
 [tool.poetry.dev-dependencies]
 pytest = "*"
