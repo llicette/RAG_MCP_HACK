@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import asyncio
 import logging
+import os
 from langfuse import Langfuse
 
 @dataclass
@@ -45,6 +46,11 @@ class BaseAgent(ABC):
                  name: str,
                  config: Dict[str, Any],
                  langfuse_client: Optional[Langfuse] = None):
+        self.langfuse_client = Langfuse(
+            secret_key=os.getenv("LANGFUSE_SECRET_KEY"),
+            public_key=os.getenv("LANGFUSE_PUBLIC_KEY"),
+            host=os.getenv("LANGFUSE_HOST")
+        )
         self.name = name
         self.config = config
         self.langfuse = langfuse_client
@@ -164,6 +170,11 @@ class AgentManager:
     """Менеджер для управления агентами"""
     
     def __init__(self, langfuse_client: Optional[Langfuse] = None):
+        self.langfuse_client = Langfuse(
+            secret_key=os.getenv("LANGFUSE_SECRET_KEY"),
+            public_key=os.getenv("LANGFUSE_PUBLIC_KEY"),
+            host=os.getenv("LANGFUSE_HOST")
+        )
         self.agents: Dict[str, BaseAgent] = {}
         self.langfuse = langfuse_client
         self.logger = logging.getLogger("agent_manager")

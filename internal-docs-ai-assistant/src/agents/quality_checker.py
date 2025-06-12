@@ -1,9 +1,9 @@
 import json
 import asyncio
-from typing import Dict, Any, List
+from typing import Dict, Any
 from langchain.llms import Ollama
 from langchain.prompts import PromptTemplate
-from base_agent import BaseAgent, AgentContext, AgentResult, with_retry, with_timeout
+from agents.base_agent import BaseAgent, AgentContext, AgentResult, with_retry, with_timeout
 
 
 class QualityCheckerAgent(BaseAgent):
@@ -23,43 +23,32 @@ class QualityCheckerAgent(BaseAgent):
         )
         
         # Шаблон промпта для проверки качества
+        # Экранируем JSON-структуру двойными фигурными скобками
+        template = (
+            "Ты - эксперт, выполняющий проверку качества ответа на пользовательский запрос.\n"
+            "Запрос: {question}\n"
+            "Сгенерированный ответ: {answer}\n"
+            "Дополнительная информация (источники, документы, контекст), если есть: {context_info}\n"
+            "Проверь ответ по следующим критериям:\n"
+            "1. Фактическая точность: есть ли утверждения, требующие проверки или содержащие ошибки.\n"
+            "2. Полнота: охватывает ли ответ ключевые аспекты запроса, или есть упущения.\n"
+            "3. Соответствие вопросу: напрямую ли отвечает на запрос, не уходит ли в сторону.\n"
+            "4. Выявление потенциальных ошибок или противоречий внутри ответа.\n"
+            "5. Ясность и читаемость: насколько понятен ответ.\n"
+            "6. Соответствие стилю пользователя и требованиям компании (если указаны).\n"
+            "Ответь в JSON формате без лишнего текста, структура:\n"
+            "{{\"factual_accuracy_score\": число_0_1, "
+            "\"completeness_score\": число_0_1, "
+            "\"relevance_score\": число_0_1, "
+            "\"clarity_score\": число_0_1, "
+            "\"identified_issues\": [\"описание проблемы1\", \"описание проблемы2\"], "
+            "\"suggestions\": [\"предложение по улучшению1\", \"предложение по улучшению2\"], "
+            "\"overall_quality_score\": число_0_1}}"
+        )
         self.check_prompt = PromptTemplate(
             input_variables=["question", "answer", "context_info"],
-            template=self._get_check_prompt()
+            template=template
         )
-
-    def _get_check_prompt(self) -> str:
-        """
-        Возвращает шаблон промпта для оценки качества ответа.
-        """
-        return ("""
-        Ты - эксперт, выполняющий проверку качества ответа на пользовательский запрос.
-
-        Запрос: {question}
-
-        Сгенерированный ответ: {answer}
-
-        Дополнительная информация (источники, документы, контекст), если есть: {context_info}
-
-        Проверь ответ по следующим критериям:
-        1. Фактическая точность: есть ли утверждения, требующие проверки или содержащие ошибки.
-        2. Полнота: охватывает ли ответ ключевые аспекты запроса, или есть упущения.
-        3. Соответствие вопросу: напрямую ли отвечает на запрос, не уходит ли в сторону.
-        4. Выявление потенциальных ошибок или противоречий во внутри ответа.
-        5. Ясность и читаемость: насколько понятен ответ.
-        6. Соответствие стилю пользователя и требованиям компании (если указаны).
-
-        Ответь в JSON формате без лишнего текста:
-        {
-        "factual_accuracy_score": число_0_1,
-        "completeness_score": число_0_1,
-        "relevance_score": число_0_1,
-        "clarity_score": число_0_1,
-        "identified_issues": ["описание проблемы1", "описание проблемы2"],
-        "suggestions": ["предложение по улучшению1", "предложение по улучшению2"],
-        "overall_quality_score": число_0_1
-        }
-        """)
 
     @with_timeout(20.0)
     @with_retry(max_attempts=2)
@@ -67,7 +56,6 @@ class QualityCheckerAgent(BaseAgent):
         """
         Основная логика обработки запроса.
         """
-        # Извлечение данных из контекста
         question = context.original_query or ""
         
         if not context.metadata:
@@ -120,7 +108,6 @@ class QualityCheckerAgent(BaseAgent):
         """
         Дополнительная обработка результата.
         """
-        # Здесь можно добавить логику фильтрации, кэширования и т.д.
         return result_data
 
     def _calculate_confidence(self, result_data: Dict[str, Any], context: AgentContext) -> float:
@@ -131,7 +118,6 @@ class QualityCheckerAgent(BaseAgent):
             score = result_data.get("overall_quality_score")
             if isinstance(score, (int, float)):
                 return max(0.0, min(1.0, float(score)))
-        
         return 0.0
 
 
@@ -144,8 +130,6 @@ def create_quality_checker_agent(config: Dict[str, Any] = None, langfuse_client=
         "temperature": 0.0,
         "ollama_base_url": "http://localhost:11434"
     }
-    
     if config:
         default_config.update(config)
-        
     return QualityCheckerAgent(default_config, langfuse_client)

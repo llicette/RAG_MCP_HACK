@@ -11,7 +11,7 @@ import numpy as np
 from langchain.llms import Ollama
 from langchain.prompts import PromptTemplate
 
-from base_agent import BaseAgent, AgentContext, with_retry, with_timeout
+from agents.base_agent import BaseAgent, AgentContext, with_retry, with_timeout
 
 class TopicClassifierAgent(BaseAgent):
     """Агент для классификации тематики запросов"""

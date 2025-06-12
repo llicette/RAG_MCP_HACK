@@ -8,7 +8,7 @@ from typing import Dict, Any, List, Optional
 from langchain.llms import Ollama
 from langchain.prompts import PromptTemplate
 
-from base_agent import BaseAgent, AgentContext, with_retry, with_timeout
+from agents.base_agent import BaseAgent, AgentContext, with_retry, with_timeout
 
 class QueryRewriterAgent(BaseAgent):
     """Агент для переписывания запросов для лучшего поиска"""
