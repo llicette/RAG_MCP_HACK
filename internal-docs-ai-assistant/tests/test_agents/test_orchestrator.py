@@ -1,6 +1,9 @@
 import pytest
 import asyncio
-import os
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain.schema import Document
+
 from agents.base_agent import AgentManager
 from agents.question_critic import create_question_critic_agent
 from agents.query_rewriter import create_query_rewriter_agent
@@ -10,9 +13,7 @@ from agents.context_enricher import create_context_enricher_agent
 from agents.answer_generator import create_answer_generator_agent
 from agents.quality_checker import create_quality_checker_agent
 from core.orchestrator import DocumentationOrchestrator
-from langchain.schema import Document
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_chroma import Chroma
+
 import logging
 logging.basicConfig(level=logging.DEBUG)
 
@@ -33,7 +34,7 @@ async def test_full_workflow_integration_real(ollama_health, tmp_path):
         embedding_function=embeddings,
         collection_name="wf_test"
     )
-    # добавляем документы, нужные для ответа:
+    # Добавляем документы, нужные для ответа:
     docs = [
         Document(page_content="Процедура оформления отпуска: шаги и требования", metadata={"source": "doc1", "title": "Оформление отпуска"}),
         Document(page_content="Правила отпуска для сотрудников: условие и баланс дней", metadata={"source": "doc2", "title": "Правила отпуска"}),
@@ -96,7 +97,7 @@ async def test_full_workflow_integration_real(ollama_health, tmp_path):
         assert isinstance(res["answer"], str) and res["answer"].strip() != ""
     # confidence должно быть число в диапазоне [0,1]
     conf = res.get("confidence")
-    assert isinstance(conf, (int,float)) and 0.0 <= float(conf) <= 1.0
+    assert isinstance(conf, (int, float)) and 0.0 <= float(conf) <= 1.0
     # В metadata гарантированно есть ключи confidence_scores и errors
     metadata = res.get("metadata", {})
     assert "confidence_scores" in metadata and isinstance(metadata["confidence_scores"], dict)

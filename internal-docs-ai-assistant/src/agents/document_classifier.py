@@ -1,129 +1,123 @@
 import re
-import os
-from typing import Dict, Any, List, Tuple, Optional, Union
-from enum import Enum
+import json
+import uuid
 import asyncio
-from datetime import datetime, timedelta
-from pathlib import Path
-import magic
+import os
 import hashlib
-from collections import Counter, defaultdict
+from typing import Dict, Any, List, Optional
+from enum import Enum
+from datetime import datetime
+from collections import defaultdict
 
-# ML и NLP библиотеки
 import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.cluster import KMeans
 import nltk
-from nltk.tokenize import sent_tokenize, word_tokenize
+from nltk.tokenize import sent_tokenize
 from nltk.corpus import stopwords
 
-# LangChain
-from langchain.llms import Ollama
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+from langchain_community.llms import Ollama  # если у вас старая версия, можно: from langchain.llms import Ollama
 from langchain.prompts import PromptTemplate
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
 
-# PDF и документы
 import PyPDF2
 import docx
 from bs4 import BeautifulSoup
-import pandas as pd
 
 from agents.base_agent import BaseAgent, AgentContext, AgentResult, with_retry, with_timeout
+from configs.settings import settings
 
 
 class DocumentType(Enum):
-    """Типы документов"""
-    POLICY = "policy"  # Политики и положения
-    PROCEDURE = "procedure"  # Процедуры и инструкции
-    REGULATION = "regulation"  # Регламенты
-    FORM = "form"  # Формы и бланки
-    MANUAL = "manual"  # Руководства
-    FAQ = "faq"  # Часто задаваемые вопросы
-    ANNOUNCEMENT = "announcement"  # Объявления и новости
-    REPORT = "report"  # Отчеты
-    CONTRACT = "contract"  # Договоры
-    GUIDE = "guide"  # Справочники и гиды
-    TRAINING = "training"  # Обучающие материалы
-    TECHNICAL = "technical"  # Техническая документация
-    OTHER = "other"  # Прочие документы
+    POLICY = "policy"
+    PROCEDURE = "procedure"
+    REGULATION = "regulation"
+    FORM = "form"
+    MANUAL = "manual"
+    FAQ = "faq"
+    ANNOUNCEMENT = "announcement"
+    REPORT = "report"
+    CONTRACT = "contract"
+    GUIDE = "guide"
+    TRAINING = "training"
+    TECHNICAL = "technical"
+    OTHER = "other"
+
 
 class DocumentPriority(Enum):
-    """Приоритет документа"""
-    CRITICAL = 1  # Критически важные
-    HIGH = 2     # Высокий приоритет
-    MEDIUM = 3   # Средний приоритет
-    LOW = 4      # Низкий приоритет
+    CRITICAL = "critical"
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
 
 class DocumentAudience(Enum):
-    """Целевая аудитория"""
-    ALL_EMPLOYEES = "all_employees"  # Все сотрудники
-    MANAGEMENT = "management"        # Руководство
-    HR = "hr"                       # HR отдел
-    IT = "it"                       # IT отдел
-    FINANCE = "finance"             # Финансовый отдел
-    LEGAL = "legal"                 # Юридический отдел
-    SPECIFIC_ROLE = "specific_role" # Определенная роль
-    NEW_EMPLOYEES = "new_employees" # Новые сотрудники
+    ALL_EMPLOYEES = "all_employees"
+    MANAGEMENT = "management"
+    HR = "hr"
+    IT = "it"
+    FINANCE = "finance"
+    LEGAL = "legal"
+    SPECIFIC_ROLE = "specific_role"
+    NEW_EMPLOYEES = "new_employees"
+
 
 class DocumentClassifierAgent(BaseAgent):
-    """Агент для классификации документов внутренней документации"""
-    
+    """Агент для классификации документов внутренней документации."""
+
     def __init__(self, config: Dict[str, Any], langfuse_client=None):
         super().__init__("document_classifier", config, langfuse_client)
-        
-        # LLM для анализа содержимого
-        self.llm = Ollama(
-            model=self.get_config("model_name", "llama3.1:8b"),
-            temperature=self.get_config("temperature", 0.1),
-            base_url=self.get_config("ollama_base_url", "http://localhost:11434")
-        )
-        
-        # Настройка классификационных правил
+
+        # Инициализация LLM
+        model_name = self.get_config("model_name", settings.LLM_MODEL_NAME)
+        base_url = self.get_config("ollama_base_url", None) or str(settings.LLM_BASE_URL)
+        temperature = float(self.get_config("temperature", 0.1))
+        self.llm = Ollama(model=model_name, temperature=temperature, base_url=base_url)
+
+        # Настройка правил и ключевых слов
         self.classification_rules = self._setup_classification_rules()
-        
-        # Ключевые слова для классификации
         self.type_keywords = self._setup_type_keywords()
         self.priority_keywords = self._setup_priority_keywords()
         self.audience_keywords = self._setup_audience_keywords()
-        
-        # TF-IDF для семантического анализа
-        self.tfidf_vectorizer = None
-        self.document_type_vectors = None
-        self._initialize_vectorizer()
-        
-        # Стоп-слова
+
+        # NLP: стоп-слова, nltk
         try:
             self.stop_words = set(stopwords.words('russian'))
-        except:
+        except Exception:
             nltk.download('stopwords')
             nltk.download('punkt')
             self.stop_words = set(stopwords.words('russian'))
-        
-        # Сплиттер текста
+
+        # TF-IDF векторизатор для семантики типов документов
+        self.tfidf_vectorizer = None
+        self.document_type_vectors = None
+        self.type_names = []
+        self._initialize_vectorizer()
+
+        # Текстовый сплиттер для детального анализа
         self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
+            chunk_size=int(self.get_config("chunk_size", 1000)),
+            chunk_overlap=int(self.get_config("chunk_overlap", 200)),
             length_function=len
         )
-        
-        # Промпты для LLM анализа
+
+        # PromptTemplates с экранированием двойными {{ }}
         self.classification_prompt = PromptTemplate(
-            input_variables=["document_text", "filename", "metadata"],
+            input_variables=["document_text", "filename", "metadata_str"],
             template=self._get_classification_prompt()
         )
-        
         self.content_analysis_prompt = PromptTemplate(
             input_variables=["document_content", "document_type"],
             template=self._get_content_analysis_prompt()
         )
-        
-        # Кэш для классификации
-        self.classification_cache = {}
-        
+
+        # Внутренний кэш: ключ — хэш документа, значение — результат классификации
+        self.classification_cache: Dict[str, Dict[str, Any]] = {}
+
     def _setup_classification_rules(self) -> Dict[str, Any]:
-        """Настройка правил классификации документов"""
+        """Настройка правил классификации документов."""
         return {
             "filename_patterns": {
                 DocumentType.POLICY: [
@@ -163,7 +157,6 @@ class DocumentClassifierAgent(BaseAgent):
                     r"contract.*\.pdf"
                 ]
             },
-            
             "content_indicators": {
                 DocumentType.POLICY: [
                     "настоящая политика", "данная политика", "политика компании",
@@ -183,10 +176,9 @@ class DocumentClassifierAgent(BaseAgent):
                 ],
                 DocumentType.FAQ: [
                     "часто задаваемые вопросы", "вопрос:", "ответ:",
-                    "Q:", "A:", "FAQ"
+                    "q&a", "faq", "ответы на вопросы"
                 ]
             },
-            
             "structural_patterns": {
                 DocumentType.POLICY: ["введение", "область применения", "ответственность"],
                 DocumentType.PROCEDURE: ["цель", "область применения", "описание процедуры"],
@@ -195,9 +187,9 @@ class DocumentClassifierAgent(BaseAgent):
                 DocumentType.REPORT: ["аннотация", "выводы", "рекомендации"]
             }
         }
-    
+
     def _setup_type_keywords(self) -> Dict[DocumentType, List[str]]:
-        """Ключевые слова для определения типа документа"""
+        """Ключевые слова для типов документов."""
         return {
             DocumentType.POLICY: [
                 "политика", "положение", "принципы", "ценности", "этика",
@@ -248,9 +240,9 @@ class DocumentClassifierAgent(BaseAgent):
                 "интеграция", "настройка", "конфигурация"
             ]
         }
-    
+
     def _setup_priority_keywords(self) -> Dict[DocumentPriority, List[str]]:
-        """Ключевые слова для определения приоритета"""
+        """Ключевые слова для приоритета."""
         return {
             DocumentPriority.CRITICAL: [
                 "критически важно", "обязательно", "немедленно",
@@ -270,9 +262,9 @@ class DocumentClassifierAgent(BaseAgent):
                 "справочно", "информационно", "вспомогательный"
             ]
         }
-    
+
     def _setup_audience_keywords(self) -> Dict[DocumentAudience, List[str]]:
-        """Ключевые слова для определения целевой аудитории"""
+        """Ключевые слова для аудитории."""
         return {
             DocumentAudience.ALL_EMPLOYEES: [
                 "все сотрудники", "весь персонал", "каждый сотрудник",
@@ -303,46 +295,36 @@ class DocumentClassifierAgent(BaseAgent):
                 "адаптация", "введение", "первый день"
             ]
         }
-    
+
     def _initialize_vectorizer(self):
-        """Инициализация TF-IDF векторизатора для типов документов"""
+        """Инициализация TF-IDF для семантики."""
         try:
-            # Создаем корпус из ключевых слов каждого типа
+            # Минимальный корпус: ключевые слова каждого типа
             type_texts = []
-            type_names = []
-            
             for doc_type, keywords in self.type_keywords.items():
-                type_text = " ".join(keywords)
-                type_texts.append(type_text)
-                type_names.append(doc_type)
-            
+                type_texts.append(" ".join(keywords))
+                self.type_names.append(doc_type)
             self.tfidf_vectorizer = TfidfVectorizer(
                 max_features=500,
                 stop_words=list(self.stop_words),
                 ngram_range=(1, 2),
                 min_df=1
             )
-            
             self.document_type_vectors = self.tfidf_vectorizer.fit_transform(type_texts)
-            self.type_names = type_names
-            
         except Exception as e:
             self.logger.warning(f"Не удалось инициализировать TF-IDF: {e}")
             self.tfidf_vectorizer = None
-    
+            self.document_type_vectors = None
+
     def _get_classification_prompt(self) -> str:
-        """Промпт для классификации документа"""
-        # Экранируем фигурные скобки JSON-примера двойными {{ и }}
+        """Prompt для LLM-классификации документа."""
+        # Экранируем двойными {{ }} JSON-образец
         return (
-            "Ты - эксперт по классификации внутренних документов компании.\n"
-            "\n"
+            "Ты — эксперт по классификации внутренних документов компании.\n"
             "Имя файла: {filename}\n"
-            "Метаданные: {metadata}\n"
-            "\n"
+            "Метаданные: {metadata_str}\n"
             "Содержимое документа (первые 2000 символов):\n{document_text}\n"
-            "\n"
             "Проанализируй документ и определи:\n"
-            "\n"
             "1. Тип документа из списка:\n"
             "   - policy: Политики и положения компании\n"
             "   - procedure: Процедуры и инструкции\n"
@@ -357,13 +339,11 @@ class DocumentClassifierAgent(BaseAgent):
             "   - training: Обучающие материалы\n"
             "   - technical: Техническая документация\n"
             "   - other: Прочие документы\n"
-            "\n"
             "2. Приоритет документа:\n"
             "   - critical: Критически важный\n"
             "   - high: Высокий приоритет\n"
             "   - medium: Средний приоритет\n"
             "   - low: Низкий приоритет\n"
-            "\n"
             "3. Целевая аудитория:\n"
             "   - all_employees: Все сотрудники\n"
             "   - management: Руководство\n"
@@ -373,13 +353,15 @@ class DocumentClassifierAgent(BaseAgent):
             "   - legal: Юридический отдел\n"
             "   - specific_role: Определенная роль\n"
             "   - new_employees: Новые сотрудники\n"
-            "\n"
             "4. Дополнительные характеристики:\n"
-            "   - Требует ли документ регулярного обновления\n"
-            "   - Содержит ли конфиденциальную информацию\n"
-            "   - Есть ли срок действия\n"
-            "\n"
-            "Ответь в JSON формате:\n"
+            "   - requires_updates (true/false)\n"
+            "   - confidential (true/false)\n"
+            "   - has_expiry (true/false)\n"
+            "   - estimated_validity_months (число или null)\n"
+            "5. Ключевые темы (key_topics) — список важных тем из документа.\n"
+            "6. Назначение документа (document_purpose) — короткое описание.\n"
+            "7. Reasoning — объяснение выбора.\n"
+            "Ответь строго в JSON формате:\n"
             "{{\n"
             "  \"document_type\": \"тип_документа\",\n"
             "  \"priority\": \"приоритет\",\n"
@@ -389,28 +371,24 @@ class DocumentClassifierAgent(BaseAgent):
             "  \"confidential\": true/false,\n"
             "  \"has_expiry\": true/false,\n"
             "  \"estimated_validity_months\": число_или_null,\n"
-            "  \"key_topics\": [\"тема1\", \"тема2\", \"тема3\"],\n"
-            "  \"document_purpose\": \"краткое_описание_назначения\",\n"
-            "  \"reasoning\": \"объяснение_классификации\"\n"
+            "  \"key_topics\": [\"тема1\", \"тема2\"],\n"
+            "  \"document_purpose\": \"краткое описание\",\n"
+            "  \"reasoning\": \"объяснение\"\n"
             "}}"
         )
-    
+
     def _get_content_analysis_prompt(self) -> str:
-        """Промпт для анализа содержимого документа"""
-        # Экранируем JSON-пример двойными {{ }}
+        """Prompt для детального анализа содержимого документа."""
         return (
             "Проанализируй содержимое документа типа \"{document_type}\" и извлеки ключевую информацию.\n"
-            "\n"
             "Содержимое документа:\n{document_content}\n"
-            "\n"
             "Определи:\n"
             "1. Основные разделы и структуру документа\n"
             "2. Ключевые термины и понятия\n"
             "3. Действия, которые описаны в документе\n"
             "4. Связанные процессы или документы\n"
             "5. Важные даты, сроки, числовые показатели\n"
-            "\n"
-            "Ответь в JSON формате:\n"
+            "Ответь строго в JSON формате:\n"
             "{{\n"
             "  \"main_sections\": [\"раздел1\", \"раздел2\"],\n"
             "  \"key_terms\": [\"термин1\", \"термин2\"],\n"
@@ -423,431 +401,446 @@ class DocumentClassifierAgent(BaseAgent):
             "  \"completeness_score\": число_0_1\n"
             "}}"
         )
-    
-    @with_timeout(60.0)
+
+    @with_timeout(120.0)
     @with_retry(max_attempts=2)
     async def _process(self, context: AgentContext) -> Dict[str, Any]:
-        """Основная логика классификации документа"""
-        
-        # Получение информации о документе
-        document_info = context.metadata.get("document_info", {})
-        if not document_info:
-            raise ValueError("Отсутствует информация о документе в контексте")
-        
-        # Извлечение текста документа
+        """
+        Основная логика классификации документа.
+        Ожидается, что в context.metadata["document_info"] есть словарь с ключами:
+        - file_path (опционально) или content (строка)
+        - filename, size, author, и т.п.
+        """
+        # Определяем уникальный идентификатор документа: либо из metadata, либо генерируем
+        document_info = context.metadata.get("document_info")
+        if not isinstance(document_info, dict):
+            raise ValueError("DocumentClassifierAgent: в context.metadata нет ключа 'document_info' или он неверный")
+
+        # Генерируем или берём doc_id для кэша
+        doc_id = context.metadata.get("doc_id") or str(uuid.uuid4())
+        # Создадим хэш по filename+size+фрагменту текста
+        # Сначала пытаемся извлечь текст
         document_text = await self._extract_text(document_info)
         if not document_text:
-            raise ValueError("Не удалось извлечь текст из документа")
-        
-        # Создание хэша для кэширования
-        doc_hash = self._create_document_hash(document_info, document_text[:1000])
-        
-        # Проверка кэша
+            raise ValueError("DocumentClassifierAgent: не удалось извлечь текст")
+
+        text_sample = document_text[:2000]
+        hash_input = f"{document_info.get('filename','')}{document_info.get('size','')}{text_sample}"
+        doc_hash = hashlib.md5(hash_input.encode('utf-8')).hexdigest()
+
+        # Кэширование в памяти
         if doc_hash in self.classification_cache:
-            self.logger.info("Результат найден в кэше")
+            self.logger.info("DocumentClassifierAgent: результат найден в кэше")
             return self.classification_cache[doc_hash]
-        
-        # Многоуровневая классификация
+
+        # Анализы
         filename_analysis = self._analyze_filename(document_info)
         content_analysis = self._analyze_content(document_text)
         structure_analysis = self._analyze_structure(document_text)
         metadata_analysis = self._analyze_metadata(document_info)
-        
-        # Приоритет и аудитория
         priority_analysis = self._analyze_priority(document_text)
         audience_analysis = self._analyze_audience(document_text)
-        
-        # LLM анализ
-        llm_analysis = await self._llm_classification(
-            document_text, document_info, context
-        )
-        
-        # Семантический анализ
+        llm_analysis = await self._llm_classification(document_text, document_info, context)
         semantic_analysis = self._semantic_analysis(document_text)
-        
-        # Объединение результатов
+
+        # Объединяем
         final_classification = self._combine_analyses(
             filename_analysis, content_analysis, structure_analysis,
             metadata_analysis, llm_analysis, semantic_analysis,
             priority_analysis, audience_analysis
         )
-        
-        # Детальный анализ содержимого
-        if final_classification.get("confidence", 0) > 0.5:
-            content_details = await self._detailed_content_analysis(
-                document_text, final_classification.get("document_type")
-            )
-            final_classification["content_analysis"] = content_details
-        
-        # Сохранение в кэш
-        self.classification_cache[doc_hash] = final_classification
-        
-        return final_classification
-    
-    async def _extract_text(self, document_info: Dict[str, Any]) -> str:
-        """Извлечение текста из документа"""
+
+        # Если уверенность достаточна, проводим детальный анализ содержимого
         try:
-            file_path = document_info.get("file_path")
-            file_type = document_info.get("file_type", "").lower()
-            
-            if not file_path or not os.path.exists(file_path):
-                # Если передан сам текст
-                return document_info.get("content", "")
-            
-            # Определение типа файла
-            if not file_type:
-                file_type = magic.from_file(file_path, mime=True)
-            
-            if file_type == "application/pdf" or file_path.endswith('.pdf'):
+            conf = float(final_classification.get("confidence", 0.0))
+        except Exception:
+            conf = 0.0
+        if conf > 0.5:
+            details = await self._detailed_content_analysis(document_text, final_classification.get("document_type"))
+            final_classification["content_analysis"] = details
+
+        # Сохраняем в кэш
+        self.classification_cache[doc_hash] = final_classification
+
+        return final_classification
+
+    async def _extract_text(self, document_info: Dict[str, Any]) -> str:
+        """Извлекает текст из файла или берёт из document_info['content']."""
+        file_path = document_info.get("file_path")
+        content_override = document_info.get("content")
+        if content_override and isinstance(content_override, str) and not file_path:
+            return content_override
+
+        if not file_path or not os.path.exists(file_path):
+            # Если поле content не задано или файл не найден
+            return content_override or ""
+
+        # По расширению или mime-типу
+        lower = file_path.lower()
+        try:
+            if lower.endswith(".pdf"):
                 return await self._extract_pdf_text(file_path)
-            elif file_type in ["application/vnd.openxmlformats-officedocument.wordprocessingml.document"] or file_path.endswith('.docx'):
+            elif lower.endswith(".docx"):
                 return await self._extract_docx_text(file_path)
-            elif file_type == "text/html" or file_path.endswith('.html'):
+            elif lower.endswith(".html") or lower.endswith(".htm"):
                 return await self._extract_html_text(file_path)
-            elif file_type == "text/plain" or file_path.endswith('.txt'):
+            elif lower.endswith(".txt"):
                 return await self._extract_txt_text(file_path)
             else:
-                self.logger.warning(f"Неподдерживаемый тип файла: {file_type}")
+                # Можно расширить для других типов
+                self.logger.warning(f"DocumentClassifierAgent: неподдерживаемый тип файла {file_path}")
                 return ""
-                
         except Exception as e:
-            self.logger.error(f"Ошибка извлечения текста: {e}")
+            self.logger.error(f"DocumentClassifierAgent: ошибка при извлечении текста: {e}")
             return ""
-    
+
     async def _extract_pdf_text(self, file_path: str) -> str:
-        """Извлечение текста из PDF"""
         def extract():
-            with open(file_path, 'rb') as file:
-                reader = PyPDF2.PdfReader(file)
-                text = ""
-                for page in reader.pages:
-                    page_text = page.extract_text() or ''
-                    text += page_text + "\n"
-                return text
-        
-        return await asyncio.to_thread(extract)
-    
-    async def _extract_docx_text(self, file_path: str) -> str:
-        """Извлечение текста из DOCX"""
-        def extract():
-            doc = docx.Document(file_path)
             text = ""
-            for paragraph in doc.paragraphs:
-                text += paragraph.text + "\n"
+            try:
+                with open(file_path, "rb") as f:
+                    reader = PyPDF2.PdfReader(f)
+                    for page in reader.pages:
+                        page_text = page.extract_text() or ""
+                        text += page_text + "\n"
+            except Exception as e:
+                # Логируем, но возвращаем то, что удалось
+                self.logger.error(f"DocumentClassifierAgent: PDF extract error: {e}")
             return text
-        
         return await asyncio.to_thread(extract)
-    
+
+    async def _extract_docx_text(self, file_path: str) -> str:
+        def extract():
+            text = ""
+            try:
+                doc = docx.Document(file_path)
+                for p in doc.paragraphs:
+                    text += p.text + "\n"
+            except Exception as e:
+                self.logger.error(f"DocumentClassifierAgent: DOCX extract error: {e}")
+            return text
+        return await asyncio.to_thread(extract)
+
     async def _extract_html_text(self, file_path: str) -> str:
-        """Извлечение текста из HTML"""
         def extract():
-            with open(file_path, 'r', encoding='utf-8') as file:
-                soup = BeautifulSoup(file.read(), 'html.parser')
-                return soup.get_text()
-        
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    soup = BeautifulSoup(f, "html.parser")
+                    return soup.get_text(separator="\n")
+            except Exception as e:
+                self.logger.error(f"DocumentClassifierAgent: HTML extract error: {e}")
+                return ""
         return await asyncio.to_thread(extract)
-    
+
     async def _extract_txt_text(self, file_path: str) -> str:
-        """Извлечение текста из TXT"""
         def extract():
-            with open(file_path, 'r', encoding='utf-8') as file:
-                return file.read()
-        
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    return f.read()
+            except Exception as e:
+                self.logger.error(f"DocumentClassifierAgent: TXT extract error: {e}")
+                return ""
         return await asyncio.to_thread(extract)
-    
-    def _create_document_hash(self, document_info: Dict, text_sample: str) -> str:
-        """Создание хэша документа для кэширования"""
-        hash_string = f"{document_info.get('filename', '')}{document_info.get('size', '')}{text_sample}"
-        return hashlib.md5(hash_string.encode()).hexdigest()
-    
+
     def _analyze_filename(self, document_info: Dict[str, Any]) -> Dict[str, Any]:
-        """Анализ имени файла"""
-        filename = document_info.get("filename", "").lower()
-        
+        """Анализ по имени файла."""
+        filename = (document_info.get("filename") or "").lower()
         type_scores = {}
-        
-        # Проверка паттернов имен файлов
-        for doc_type, patterns in self.classification_rules["filename_patterns"].items():
+        # По шаблонам
+        for doc_type, patterns in self.classification_rules.get("filename_patterns", {}).items():
             score = 0
-            for pattern in patterns:
-                if re.search(pattern, filename):
+            for pat in patterns:
+                if re.search(pat, filename):
                     score += 2
             type_scores[doc_type] = score
-        
-        # Проверка ключевых слов в имени
+        # По ключевым словам
         for doc_type, keywords in self.type_keywords.items():
-            score = type_scores.get(doc_type, 0)
-            for keyword in keywords:
-                if keyword in filename:
-                    score += 1
-            type_scores[doc_type] = score
-        
+            sc = type_scores.get(doc_type, 0)
+            for kw in keywords:
+                if kw in filename:
+                    sc += 1
+            type_scores[doc_type] = sc
         if not type_scores or max(type_scores.values()) == 0:
             return {"method": "filename", "document_type": DocumentType.OTHER, "confidence": 0.0}
-        
-        best_type = max(type_scores.items(), key=lambda x: x[1])[0]
-        confidence = min(type_scores[best_type] / 5, 1.0)
-        
-        return {
-            "method": "filename",
-            "document_type": best_type,
-            "confidence": confidence,
-            "type_scores": type_scores
-        }
-    
+        best, best_score = max(type_scores.items(), key=lambda x: x[1])
+        confidence = min(best_score / 5.0, 1.0)
+        return {"method": "filename", "document_type": best, "confidence": confidence, "type_scores": type_scores}
+
     def _analyze_content(self, document_text: str) -> Dict[str, Any]:
-        """Анализ содержимого документа"""
+        """Анализ содержимого по ключевым индикаторам и словам."""
         text_lower = document_text.lower()
-        
         type_scores = {}
-        
-        # Проверка индикаторов содержимого
+        # Индикаторы
         for doc_type, indicators in self.classification_rules.get("content_indicators", {}).items():
-            score = 0
-            for indicator in indicators:
-                if indicator in text_lower:
-                    score += 2
-            type_scores[doc_type] = score
-        
-        # Проверка ключевых слов
+            sc = 0
+            for ind in indicators:
+                if ind in text_lower:
+                    sc += 2
+            type_scores[doc_type] = sc
+        # По ключевым словам
         for doc_type, keywords in self.type_keywords.items():
-            score = type_scores.get(doc_type, 0)
-            for keyword in keywords:
-                count = text_lower.count(keyword)
-                score += count
-            type_scores[doc_type] = score
-        
+            sc = type_scores.get(doc_type, 0)
+            for kw in keywords:
+                sc += text_lower.count(kw)
+            type_scores[doc_type] = sc
         if not type_scores or max(type_scores.values()) == 0:
             return {"method": "content", "document_type": DocumentType.OTHER, "confidence": 0.0}
-        
-        best_type = max(type_scores.items(), key=lambda x: x[1])[0]
-        total_score = sum(type_scores.values())
-        confidence = type_scores[best_type] / total_score if total_score > 0 else 0.0
-        
-        return {
-            "method": "content",
-            "document_type": best_type,
-            "confidence": min(confidence, 1.0),
-            "type_scores": type_scores
-        }
-    
+        best, best_score = max(type_scores.items(), key=lambda x: x[1])
+        total = sum(type_scores.values())
+        confidence = best_score / total if total > 0 else 0.0
+        return {"method": "content", "document_type": best, "confidence": min(confidence, 1.0), "type_scores": type_scores}
+
     def _analyze_structure(self, document_text: str) -> Dict[str, Any]:
-        """Анализ структуры документа"""
+        """Анализ структуры документа."""
         text_lower = document_text.lower()
-        
-        # Поиск структурных паттернов
         structure_scores = {}
-        
+        # Паттерны
         for doc_type, patterns in self.classification_rules.get("structural_patterns", {}).items():
-            score = 0
-            for pattern in patterns:
-                if pattern in text_lower:
-                    score += 1
-            structure_scores[doc_type] = score
-        
-        # Анализ структурных элементов
+            sc = 0
+            for pat in patterns:
+                if pat in text_lower:
+                    sc += 1
+            structure_scores[doc_type] = sc
+        # Элементы
         structural_elements = {
-            "has_numbered_sections": bool(re.search(r'\d+\.\s+[А-Яа-я]', document_text)),
+            "has_numbered_sections": bool(re.search(r'\d+\.\s+[А-ЯA-Za-z]', document_text)),
             "has_bullet_points": bool(re.search(r'[•\-\*]\s+', document_text)),
             "has_tables": bool(re.search(r'\|.*\|', document_text)),
             "has_signatures": bool(re.search(r'подпись|signature', text_lower)),
             "has_dates": bool(re.search(r'\d{1,2}\.\d{1,2}\.\d{4}', document_text)),
-            "has_forms": bool(re.search(r'_____+|\.\.\.\.\.+', document_text))
+            "has_forms": bool(re.search(r'_{3,}', document_text))
         }
-        
-        # Дополнительная оценка на основе структуры
-        if structural_elements["has_forms"]:
+        # Уточнения
+        if structural_elements.get("has_forms"):
             structure_scores[DocumentType.FORM] = structure_scores.get(DocumentType.FORM, 0) + 3
-        
-        if structural_elements["has_numbered_sections"]:
+        if structural_elements.get("has_numbered_sections"):
             structure_scores[DocumentType.PROCEDURE] = structure_scores.get(DocumentType.PROCEDURE, 0) + 2
             structure_scores[DocumentType.MANUAL] = structure_scores.get(DocumentType.MANUAL, 0) + 2
-        
         if not structure_scores:
             return {"method": "structure", "document_type": DocumentType.OTHER, "confidence": 0.0}
-        
-        best_type = max(structure_scores.items(), key=lambda x: x[1])[0]
-        confidence = min(structure_scores[best_type] / 5, 1.0)
-        
+        best, best_score = max(structure_scores.items(), key=lambda x: x[1])
+        confidence = min(best_score / 5.0, 1.0)
         return {
             "method": "structure",
-            "document_type": best_type,
+            "document_type": best,
             "confidence": confidence,
             "structure_scores": structure_scores,
             "structural_elements": structural_elements
         }
-    
+
     def _analyze_metadata(self, document_info: Dict[str, Any]) -> Dict[str, Any]:
-        """Анализ метаданных документа"""
-        # Пример метаданных: filename, size, created_at, modified_at, author, tags
+        """Анализ метаданных документа."""
+        # Собираем простые поля
         metadata = {}
         if 'filename' in document_info:
             metadata['filename'] = document_info['filename']
         if 'size' in document_info:
             metadata['size'] = document_info['size']
-        # Даты создания/изменения
         for date_field in ['created_at', 'modified_at', 'creation_date', 'modified_date']:
             if date_field in document_info:
                 metadata[date_field] = document_info[date_field]
         if 'author' in document_info:
             metadata['author'] = document_info['author']
-        # Здесь можно добавлять дополнительные правила по метаданным
-        # Если есть теги, метки конфиденциальности
-        confidential = False
-        if 'confidential' in document_info:
-            confidential = bool(document_info.get('confidential'))
+        confidential = bool(document_info.get('confidential', False))
         metadata['confidential_flag'] = confidential
-        
-        # По умолчанию не определяем тип из метаданных
-        return {"method": "metadata", "metadata": metadata, "confidential_flag": confidential, "document_type": None, "confidence": 0.0}
-    
+        # По умолчанию document_type не определяем здесь
+        return {"method": "metadata", "metadata": metadata, "confidential_flag": confidential,
+                "document_type": None, "confidence": 0.0}
+
     def _analyze_priority(self, document_text: str) -> Dict[str, Any]:
-        """Анализ приоритета документа на основе ключевых слов"""
+        """Анализ приоритета по ключевым словам."""
         text_lower = document_text.lower()
         scores = {}
         for prio, keywords in self.priority_keywords.items():
-            score = 0
+            sc = 0
             for kw in keywords:
-                score += text_lower.count(kw)
-            scores[prio] = score
+                sc += text_lower.count(kw)
+            scores[prio] = sc
         if not scores or max(scores.values()) == 0:
-            return {"priority": DocumentPriority.MEDIUM, "confidence": 0.0, "priority_scores": scores}
-        best = max(scores.items(), key=lambda x: x[1])[0]
+            return {"priority": DocumentPriority.MEDIUM.value, "confidence": 0.0, "priority_scores": scores}
+        best, best_score = max(scores.items(), key=lambda x: x[1])
         total = sum(scores.values())
-        confidence = scores[best] / total if total > 0 else 0.0
-        return {"priority": best, "confidence": min(confidence, 1.0), "priority_scores": scores}
-    
+        confidence = best_score / total if total > 0 else 0.0
+        return {"priority": best.value, "confidence": min(confidence, 1.0), "priority_scores": scores}
+
     def _analyze_audience(self, document_text: str) -> Dict[str, Any]:
-        """Анализ целевой аудитории документа"""
+        """Анализ целевой аудитории по ключевым словам."""
         text_lower = document_text.lower()
         audience_counts = {}
         for aud, keywords in self.audience_keywords.items():
-            count = 0
+            cnt = 0
             for kw in keywords:
-                count += text_lower.count(kw)
-            if count > 0:
-                audience_counts[aud] = count
-        # Сортируем по убыванию
+                cnt += text_lower.count(kw)
+            if cnt > 0:
+                audience_counts[aud.value] = cnt
+        # Сортировка
         sorted_aud = sorted(audience_counts.items(), key=lambda x: x[1], reverse=True)
-        audiences = [aud for aud, cnt in sorted_aud]
+        audiences = [aud for aud, _ in sorted_aud]
         return {"target_audience": audiences, "audience_counts": audience_counts}
-    
+
     async def _llm_classification(self, document_text: str, document_info: Dict[str, Any], context: AgentContext) -> Dict[str, Any]:
-        """Классификация с помощью LLM"""
+        """Классификация через LLM."""
         try:
             sample = document_text[:2000]
-            metadata_str = str(document_info)
+            metadata_str = json.dumps(document_info, ensure_ascii=False)
             prompt = self.classification_prompt.format(
                 document_text=sample,
                 filename=document_info.get('filename', ''),
-                metadata=metadata_str
+                metadata_str=metadata_str
             )
-            response = await asyncio.to_thread(self.llm.invoke, prompt)
-            import json
-            try:
-                result = json.loads(response)
-                # Преобразуем строковые типы в Enum, если нужно
-                if 'document_type' in result:
-                    result['document_type'] = DocumentType(result['document_type']) if result['document_type'] in DocumentType._value2member_map_ else DocumentType.OTHER
-                if 'priority' in result:
-                    result['priority'] = DocumentPriority[result['priority'].upper()] if result['priority'].upper() in DocumentPriority.__members__ else None
-                if 'target_audience' in result:
-                    # Сохраняем список строк, перевести в Enum при необходимости
-                    pass
-                return result
-            except json.JSONDecodeError as e:
-                self.logger.warning(f"Не удалось распарсить JSON ответ от LLM: {e}")
+            response = await self.invoke_llm(prompt)
+            parsed = self.parse_json_response(response)
+            if not isinstance(parsed, dict):
                 return {}
+            # Приведение типов: document_type и priority из строк в значения Enum.value
+            out: Dict[str, Any] = {}
+            # document_type
+            dt = parsed.get("document_type")
+            if isinstance(dt, str) and dt in DocumentType._value2member_map_:
+                out["document_type"] = DocumentType(dt).value
+            else:
+                out["document_type"] = DocumentType.OTHER.value
+            # priority
+            pr = parsed.get("priority")
+            if isinstance(pr, str) and pr.lower() in DocumentPriority._value2member_map_:
+                out["priority"] = pr.lower()
+            else:
+                out["priority"] = None
+            # target_audience
+            ta = parsed.get("target_audience")
+            if isinstance(ta, list):
+                # оставляем только допустимые строки
+                filtered = [str(x) for x in ta if isinstance(x, str)]
+                out["target_audience"] = filtered
+            # confidence
+            try:
+                conf = float(parsed.get("confidence", 0.0))
+            except Exception:
+                conf = 0.0
+            out["confidence"] = max(0.0, min(conf, 1.0))
+            # requires_updates, confidential, has_expiry, estimated_validity_months
+            out["requires_updates"] = bool(parsed.get("requires_updates", False))
+            out["confidential"] = bool(parsed.get("confidential", False))
+            out["has_expiry"] = bool(parsed.get("has_expiry", False))
+            ev = parsed.get("estimated_validity_months")
+            out["estimated_validity_months"] = ev if isinstance(ev, (int, float)) else None
+            # key_topics
+            kt = parsed.get("key_topics")
+            if isinstance(kt, list):
+                out["key_topics"] = [str(x) for x in kt]
+            else:
+                out["key_topics"] = []
+            # document_purpose
+            dp = parsed.get("document_purpose")
+            out["document_purpose"] = str(dp) if dp is not None else ""
+            # reasoning
+            rn = parsed.get("reasoning")
+            out["reasoning"] = str(rn) if rn is not None else ""
+            return out
         except Exception as e:
-            self.logger.error(f"Ошибка при LLM классификации: {e}")
+            self.logger.error(f"DocumentClassifierAgent: ошибка LLM классификации: {e}")
             return {}
-    
+
     def _semantic_analysis(self, document_text: str) -> Dict[str, Any]:
-        """Семантическая классификация на основе TF-IDF"""
-        if not self.tfidf_vectorizer or not self.document_type_vectors:
-            return {"method": "semantic", "document_type": DocumentType.OTHER, "confidence": 0.0}
-        # Преобразуем текст: берем первые N символов или ключевые предложения
+        """Семантическая классификация через TF-IDF."""
+        if not self.tfidf_vectorizer or self.document_type_vectors is None:
+            return {"method": "semantic", "document_type": DocumentType.OTHER.value, "confidence": 0.0}
         try:
-            # Разбиваем на предложения и берем первые несколько
+            # Берём первые предложения
             sents = sent_tokenize(document_text)
-            sample = ' '.join(sents[:10])
+            sample = " ".join(sents[:10]) if sents else document_text[:500]
             vec = self.tfidf_vectorizer.transform([sample])
             sims = cosine_similarity(vec, self.document_type_vectors)[0]
-            # Найти лучший индекс
-            best_idx = int(np.argmax(sims))
-            best_type = self.type_names[best_idx]
-            confidence = float(sims[best_idx])
-            # Создаем словарь типов к значениям
-            sim_scores = {self.type_names[i]: float(sims[i]) for i in range(len(sims))}
-            return {"method": "semantic", "document_type": best_type, "confidence": confidence, "similarity_scores": sim_scores}
+            idx = int(np.argmax(sims))
+            best_type = self.type_names[idx]
+            confidence = float(sims[idx])
+            # similarity_scores
+            sim_scores = {
+                self.type_names[i].value: float(sims[i]) for i in range(len(sims))
+            }
+            return {"method": "semantic", "document_type": best_type.value, "confidence": min(confidence, 1.0), "similarity_scores": sim_scores}
         except Exception as e:
-            self.logger.warning(f"Ошибка семантического анализа: {e}")
-            return {"method": "semantic", "document_type": DocumentType.OTHER, "confidence": 0.0}
-    
-    def _combine_analyses(self, filename_analysis: Dict[str, Any], content_analysis: Dict[str, Any],
-                          structure_analysis: Dict[str, Any], metadata_analysis: Dict[str, Any],
-                          llm_analysis: Dict[str, Any], semantic_analysis: Dict[str, Any],
-                          priority_analysis: Dict[str, Any], audience_analysis: Dict[str, Any]) -> Dict[str, Any]:
-        """Объединение всех анализов в финальную классификацию"""
-        # Собираем голосование за тип документа
+            self.logger.warning(f"DocumentClassifierAgent: ошибка семантического анализа: {e}")
+            return {"method": "semantic", "document_type": DocumentType.OTHER.value, "confidence": 0.0}
+
+    def _combine_analyses(self,
+                          filename_analysis: Dict[str, Any],
+                          content_analysis: Dict[str, Any],
+                          structure_analysis: Dict[str, Any],
+                          metadata_analysis: Dict[str, Any],
+                          llm_analysis: Dict[str, Any],
+                          semantic_analysis: Dict[str, Any],
+                          priority_analysis: Dict[str, Any],
+                          audience_analysis: Dict[str, Any]) -> Dict[str, Any]:
+        """Объединяем все анализы в итоговую классификацию."""
+        # Голосование за тип документа
         scores = defaultdict(float)
-        analyses = [filename_analysis, content_analysis, structure_analysis, semantic_analysis, llm_analysis]
+        analyses = [
+            filename_analysis, content_analysis, structure_analysis,
+            semantic_analysis, llm_analysis
+        ]
+        # Веса можно настраивать
         weights = {
-            'filename': 0.5,
-            'content': 1.0,
-            'structure': 0.8,
-            'semantic': 1.0,
-            'llm': 1.5
+            "filename": 0.5,
+            "content": 1.0,
+            "structure": 0.8,
+            "semantic": 1.0,
+            "llm": 1.5
         }
         for a in analyses:
-            dtype = a.get('document_type')
-            if isinstance(dtype, DocumentType):
-                method = a.get('method', '')
+            dt = a.get("document_type")
+            method = a.get("method", "")
+            if isinstance(dt, str):
                 weight = weights.get(method, 1.0)
-                scores[dtype] += a.get('confidence', 0.0) * weight
-        # Выбор лучшего типа
+                try:
+                    conf = float(a.get("confidence", 0.0))
+                except:
+                    conf = 0.0
+                scores[dt] += conf * weight
         if scores:
-            best_type = max(scores.items(), key=lambda x: x[1])[0]
-            # нормируем confidence: отношение к сумме всех
+            best_type, best_score = max(scores.items(), key=lambda x: x[1])
             total = sum(scores.values())
-            confidence = scores[best_type] / total if total > 0 else 0.0
+            confidence = best_score / total if total > 0 else 0.0
         else:
-            best_type = DocumentType.OTHER
+            best_type = DocumentType.OTHER.value
             confidence = 0.0
+
         # Приоритет и аудитория
-        priority = priority_analysis.get('priority')
-        priority_conf = priority_analysis.get('confidence')
-        audiences = audience_analysis.get('target_audience', [])
-        # Дополнительные характеристики
-        text_lower = ''
+        priority = priority_analysis.get("priority", DocumentPriority.MEDIUM.value)
+        priority_conf = priority_analysis.get("confidence", 0.0)
+        audiences = audience_analysis.get("target_audience", [])
+
+        # Дополнительные характеристики: здесь можно расширить логику
         requires_updates = False
-        confidential = metadata_analysis.get('confidential_flag', False)
+        confidential = metadata_analysis.get("confidential_flag", False)
         has_expiry = False
         estimated_months = None
-        key_topics = []
-        document_purpose = ''
-        reasoning_parts = []
-        reasoning_parts.append(f"Выбран тип {best_type.value} с уверенностью {confidence:.2f}")
-        # Проверка на обновление
-        result = {
-            'document_type': best_type,
-            'priority': priority,
-            'target_audience': audiences,
-            'confidence': confidence,
-            'requires_updates': requires_updates,
-            'confidential': confidential,
-            'has_expiry': has_expiry,
-            'estimated_validity_months': estimated_months,
-            'key_topics': key_topics,
-            'document_purpose': document_purpose,
-            'reasoning': '; '.join(reasoning_parts)
+        key_topics: List[str] = []
+        document_purpose = ""
+        reasoning = f"Выбран тип {best_type} с уверенностью {confidence:.2f}"
+
+        result: Dict[str, Any] = {
+            "document_type": best_type,
+            "priority": priority,
+            "target_audience": audiences,
+            "confidence": min(max(confidence, 0.0), 1.0),
+            "requires_updates": requires_updates,
+            "confidential": confidential,
+            "has_expiry": has_expiry,
+            "estimated_validity_months": estimated_months,
+            "key_topics": key_topics,
+            "document_purpose": document_purpose,
+            "reasoning": reasoning
         }
         return result
-    
-    async def _detailed_content_analysis(self, document_text: str, document_type: DocumentType) -> Dict[str, Any]:
-        """Детальный анализ содержимого с LLM"""
-        # Разбиваем текст на чанки
-        docs = [Document(page_content=chunk) for chunk in self.text_splitter.split_text(document_text)]
+
+    async def _detailed_content_analysis(self, document_text: str, document_type: str) -> Dict[str, Any]:
+        """Детальный анализ с LLM: разбиваем на чанки и агрегируем результаты."""
+        # Разбиваем на чанки
+        try:
+            chunks = self.text_splitter.split_text(document_text)
+        except Exception:
+            chunks = [document_text]
         main_sections = set()
         key_terms = set()
         described_actions = set()
@@ -857,57 +850,85 @@ class DocumentClassifierAgent(BaseAgent):
         structure_scores = []
         readability_scores = []
         completeness_scores = []
-        # Ограничим количество чанков для анализа
-        for doc in docs[:5]:
+
+        # Ограничиваем число чанков для скорости
+        for chunk in chunks[:5]:
             prompt = self.content_analysis_prompt.format(
-                document_content=doc.page_content,
-                document_type=document_type.value
+                document_content=chunk,
+                document_type=document_type
             )
             try:
-                response = await asyncio.to_thread(self.llm.invoke, prompt)
-                import json
-                res = json.loads(response)
-                for k in ['main_sections', 'key_terms', 'described_actions', 'related_processes', 'important_dates', 'numerical_data']:
-                    items = res.get(k, [])
+                response = await self.invoke_llm(prompt)
+                parsed = self.parse_json_response(response)
+                if not isinstance(parsed, dict):
+                    continue
+                # Сбор полей
+                for k, target_set in [
+                    ("main_sections", main_sections),
+                    ("key_terms", key_terms),
+                    ("described_actions", described_actions),
+                    ("related_processes", related_processes),
+                    ("important_dates", important_dates),
+                    ("numerical_data", numerical_data)
+                ]:
+                    items = parsed.get(k)
                     if isinstance(items, list):
-                        if k == 'main_sections': main_sections.update(items)
-                        elif k == 'key_terms': key_terms.update(items)
-                        elif k == 'described_actions': described_actions.update(items)
-                        elif k == 'related_processes': related_processes.update(items)
-                        elif k == 'important_dates': important_dates.update(items)
-                        elif k == 'numerical_data': numerical_data.update(items)
-                # Считаем метрики
-                if 'document_structure_quality' in res:
-                    structure_scores.append(res.get('document_structure_quality', 0.0))
-                if 'readability_score' in res:
-                    readability_scores.append(res.get('readability_score', 0.0))
-                if 'completeness_score' in res:
-                    completeness_scores.append(res.get('completeness_score', 0.0))
-            except Exception:
+                        for it in items:
+                            try:
+                                target_set.add(str(it))
+                            except:
+                                pass
+                # Метрики
+                dsq = parsed.get("document_structure_quality")
+                if isinstance(dsq, (int, float)):
+                    structure_scores.append(float(dsq))
+                rs = parsed.get("readability_score")
+                if isinstance(rs, (int, float)):
+                    readability_scores.append(float(rs))
+                cs = parsed.get("completeness_score")
+                if isinstance(cs, (int, float)):
+                    completeness_scores.append(float(cs))
+            except Exception as e:
+                self.logger.warning(f"DocumentClassifierAgent: детальный анализ не удался для чанка: {e}")
                 continue
-        # Усреднение метрик
-        def avg(lst): return sum(lst)/len(lst) if lst else None
+
+        def avg(lst: List[float]) -> Optional[float]:
+            return sum(lst)/len(lst) if lst else None
+
         return {
-            'main_sections': list(main_sections),
-            'key_terms': list(key_terms),
-            'described_actions': list(described_actions),
-            'related_processes': list(related_processes),
-            'important_dates': list(important_dates),
-            'numerical_data': list(numerical_data),
-            'document_structure_quality': avg(structure_scores) if avg(structure_scores) is not None else 0.0,
-            'readability_score': avg(readability_scores) if avg(readability_scores) is not None else 0.0,
-            'completeness_score': avg(completeness_scores) if avg(completeness_scores) is not None else 0.0
+            "main_sections": list(main_sections),
+            "key_terms": list(key_terms),
+            "described_actions": list(described_actions),
+            "related_processes": list(related_processes),
+            "important_dates": list(important_dates),
+            "numerical_data": list(numerical_data),
+            "document_structure_quality": avg(structure_scores) if avg(structure_scores) is not None else 0.0,
+            "readability_score": avg(readability_scores) if avg(readability_scores) is not None else 0.0,
+            "completeness_score": avg(completeness_scores) if avg(completeness_scores) is not None else 0.0
         }
 
-# Фабрика для создания агента
+    async def _postprocess(self, result_data: Dict[str, Any], context: AgentContext) -> Dict[str, Any]:
+        # Можно сохранить результат классификации в metadata, если нужно
+        context.metadata["last_document_classification"] = result_data
+        return result_data
 
-def create_document_classifier_agent(config: Dict[str, Any] = None, 
-                                     langfuse_client=None) -> DocumentClassifierAgent:
+    def _calculate_confidence(self, result_data: Any, context: AgentContext) -> float:
+        # Возвращаем итоговое confidence, если есть
+        if isinstance(result_data, dict):
+            try:
+                conf = float(result_data.get("confidence", 0.0))
+                return min(max(conf, 0.0), 1.0)
+            except:
+                return 0.0
+        return 0.0
+
+
+def create_document_classifier_agent(config: Dict[str, Any] = None, langfuse_client=None) -> DocumentClassifierAgent:
     default_config = {
-        "model_name": "llama3.1:8b",
+        "model_name": settings.LLM_MODEL_NAME,
         "temperature": 0.1,
-        "ollama_base_url": "http://localhost:11434",
-        "max_analysis_time": 30.0
+        "ollama_base_url": str(settings.LLM_BASE_URL),
+        # Можно добавить другие default-параметры (chunk sizes и т.п.)
     }
     if config:
         default_config.update(config)

@@ -1,62 +1,86 @@
-import re
-from typing import Dict, Any, List, Tuple, Optional
+import hashlib
+import json
 import asyncio
-from collections import Counter
+import logging
+from typing import Dict, Any, List, Optional
+
 import nltk
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-import numpy as np
-from langchain.llms import Ollama
-from langchain.prompts import PromptTemplate
+
+import redis.asyncio as aioredis
 
 from agents.base_agent import BaseAgent, AgentContext, with_retry, with_timeout
+# Используйте правильный импорт Ollama в вашей среде:
+from langchain_community.llms import Ollama
+from langchain.prompts import PromptTemplate
+from configs.settings import settings  # скорректируйте путь, если нужно
+
 
 class TopicClassifierAgent(BaseAgent):
     """Агент для классификации тематики запросов"""
-    
+
     def __init__(self, config: Dict[str, Any], langfuse_client=None):
         super().__init__("topic_classifier", config, langfuse_client)
-        
-        self.llm = Ollama(
-            model=self.get_config("model_name", "llama3.1:8b"),
-            temperature=self.get_config("temperature", 0.1),
-            base_url=self.get_config("ollama_base_url", "http://localhost:11434")
-        )
-        
-        # Предопределенная иерархия тем
-        self.topic_hierarchy = self._setup_topic_hierarchy()
-        
-        # Ключевые слова для каждой темы
-        self.topic_keywords = self._setup_topic_keywords()
-        
-        # TF-IDF векторизатор для семантического анализа
-        self.tfidf_vectorizer = None
+        # Настройка LLM через Ollama
+        model_name = self.get_config("model_name", settings.LLM_MODEL_NAME)
+        base_url = self.get_config("ollama_base_url", None) or str(settings.LLM_BASE_URL)
+        temperature = float(self.get_config("temperature", 0.1))
+        self.llm = Ollama(model=model_name, temperature=temperature, base_url=base_url)
+
+        # Подключение к Redis для кэша классификации
+        redis_url = getattr(settings, "REDIS_URL", None)
+        if redis_url:
+            try:
+                self.redis = aioredis.from_url(redis_url)
+            except Exception as e:
+                self.logger.warning(f"TopicClassifierAgent: не удалось подключиться к Redis: {e}")
+                self.redis = None
+        else:
+            self.redis = None
+
+        # Иерархия тем и ключевые слова
+        # Можно переопределить через config: config может содержать "topic_hierarchy" и "topic_keywords"
+        self.topic_hierarchy = config.get("topic_hierarchy", self._setup_topic_hierarchy())
+        self.topic_keywords = config.get("topic_keywords", self._setup_topic_keywords())
+
+        # TF-IDF векторизатор
+        self.tfidf_vectorizer: Optional[TfidfVectorizer] = None
         self.topic_vectors = None
+        self.topic_names: List[str] = []
         self._initialize_vectorizer()
-        
-        # Стоп-слова
+
+        # Stop-слова для русского (или других языков, в зависимости от задачи)
         try:
-            self.stop_words = set(stopwords.words('russian'))
-        except:
+            # проверим, загружены ли корпуса
+            _ = stopwords.words('russian')
+        except (LookupError, OSError):
             nltk.download('stopwords')
             nltk.download('punkt')
+        try:
             self.stop_words = set(stopwords.words('russian'))
-        
-        # Промпт для LLM классификации
+        except Exception:
+            # Если по какой-то причине не удалось: пустой набор
+            self.stop_words = set()
+
+        # PromptTemplate для LLM-классификации
         self.classification_prompt = PromptTemplate(
-            input_variables=["question", "topics", "context"],
+            input_variables=["question", "topics", "context_str"],
             template=self._get_classification_prompt()
         )
-    
+
+        # Логгер уровень DEBUG для подробностей
+        self.logger.setLevel(logging.DEBUG)
+
     def _setup_topic_hierarchy(self) -> Dict[str, Dict]:
-        """Настройка иерархии тем для внутренней документации"""
+        """Дефолтная иерархия тем (пример)."""
         return {
             "hr": {
                 "name": "HR и кадровые вопросы",
                 "subtopics": [
-                    "отпуска", "больничные", "зарплата", "премии", 
+                    "отпуска", "больничные", "зарплата", "премии",
                     "найм", "увольнение", "аттестация", "обучение",
                     "корпоративные льготы", "дресс-код"
                 ],
@@ -136,9 +160,9 @@ class TopicClassifierAgent(BaseAgent):
                 "priority": 4
             }
         }
-    
+
     def _setup_topic_keywords(self) -> Dict[str, List[str]]:
-        """Настройка ключевых слов для каждой темы"""
+        """Дефолтные ключевые слова для каждой темы."""
         return {
             "hr": [
                 "отпуск", "больничный", "зарплата", "оклад", "премия", "найм", "увольнение",
@@ -191,39 +215,40 @@ class TopicClassifierAgent(BaseAgent):
                 "телефон", "адрес", "структура", "организация", "подразделение"
             ]
         }
-    
+
     def _initialize_vectorizer(self):
-        """Инициализация TF-IDF векторизатора"""
+        """Инициализация TF-IDF векторизатора на корпусе keyword lists."""
         try:
-            # Создаем корпус из ключевых слов каждой темы
             topic_texts = []
             topic_names = []
-            
             for topic, keywords in self.topic_keywords.items():
-                topic_text = " ".join(keywords)
+                if isinstance(keywords, list) and keywords:
+                    topic_text = " ".join(keywords)
+                else:
+                    topic_text = ""
                 topic_texts.append(topic_text)
                 topic_names.append(topic)
-            
+            # Инициализируем vectorizer, исключая стоп-слова
             self.tfidf_vectorizer = TfidfVectorizer(
                 max_features=1000,
-                stop_words=list(self.stop_words),
+                stop_words=list(self.stop_words) if self.stop_words else None,
                 ngram_range=(1, 2)
             )
-            
             self.topic_vectors = self.tfidf_vectorizer.fit_transform(topic_texts)
             self.topic_names = topic_names
-            
         except Exception as e:
-            self.logger.warning(f"Не удалось инициализировать TF-IDF: {e}")
+            self.logger.warning(f"TopicClassifierAgent: не удалось инициализировать TF-IDF: {e}")
             self.tfidf_vectorizer = None
-    
+            self.topic_vectors = None
+            self.topic_names = []
+
     def _get_classification_prompt(self) -> str:
-        """Промпт для LLM классификации"""
+        """PromptTemplate для LLM-классификации."""
         return """Ты - эксперт по классификации вопросов для системы внутренней документации компании.
 
 Вопрос пользователя: "{question}"
 
-Контекст (если есть): {context}
+Контекст (если есть): {context_str}
 
 Доступные категории:
 {topics}
@@ -234,307 +259,409 @@ class TopicClassifierAgent(BaseAgent):
 3. Контекст запроса
 4. Возможные подтемы
 
-Ответь в JSON формате:
+Ответь строго в JSON формате:
 {{
-  "primary_topic": "основная_категория",
-  "confidence": 0.0-1.0,
-  "secondary_topics": ["дополнительная_категория_1", "дополнительная_категория_2"],
-  "reasoning": "объяснение выбора",
-  "keywords_found": ["найденные_ключевые_слова"],
+  "primary_topic": "основная_категория", 
+  "confidence": 0.0-1.0, 
+  "secondary_topics": ["дополнительная_категория_1", "дополнительная_категория_2"], 
+  "reasoning": "объяснение выбора", 
+  "keywords_found": ["найденные_ключевые_слова"], 
   "subtopic_hints": ["возможные_подтемы"]
 }}
 
-Отвечай только валидным JSON без дополнительных комментариев."""
-    
+Отвечай только валидным JSON без лишних комментариев."""
+
     @with_timeout(30.0)
     @with_retry(max_attempts=2)
     async def _process(self, context: AgentContext) -> Dict[str, Any]:
-        """Основная логика классификации темы"""
-        question = context.original_query
-        
-        # Многоуровневая классификация
-        keyword_analysis = self._analyze_keywords(question)
-        tfidf_analysis = self._analyze_tfidf(question)
-        llm_analysis = await self._llm_classification(question, context)
-        
-        # Объединение результатов
-        final_classification = self._combine_classifications(
-            keyword_analysis, tfidf_analysis, llm_analysis
-        )
-        
-        # Добавление метаданных
-        final_classification["analysis_methods"] = {
+        """Основная логика классификации темы."""
+        question = context.processed_query or context.original_query or ""
+        question_str = question.strip()
+        if not question_str:
+            # Пустой или отсутствующий запрос
+            result = {
+                "primary_topic": "general",
+                "confidence": 0.0,
+                "secondary_topics": [],
+                "reasoning": "Нет текста запроса для классификации",
+                "keywords_found": [],
+                "subtopic_hints": []
+            }
+            # Сохраняем в metadata
+            context.metadata["topic_classification"] = result
+            return result
+
+        # Кэширование: вычисляем ключ по хэшу вопроса
+        cache_key = None
+        if self.redis:
+            # используем sha256, чтобы ключ был фиксированной длины
+            h = hashlib.sha256(question_str.encode('utf-8')).hexdigest()
+            cache_key = f"topic_classify:{h}"
+            try:
+                cached = await self.redis.get(cache_key)
+                if cached:
+                    try:
+                        cached_obj = json.loads(cached)
+                        self.logger.debug("TopicClassifierAgent: взят результат из кеша")
+                        # Сохраняем в metadata и возвращаем
+                        context.metadata["topic_classification"] = cached_obj
+                        return cached_obj
+                    except Exception:
+                        pass
+            except Exception as e:
+                self.logger.warning(f"TopicClassifierAgent: не удалось прочитать из Redis: {e}")
+
+        # Keyword-анализ
+        keyword_analysis = self._analyze_keywords(question_str)
+        # TF-IDF-анализ
+        tfidf_analysis = self._analyze_tfidf(question_str)
+        # LLM-анализ
+        llm_analysis = await self._llm_classification(question_str, context)
+
+        # Объединение
+        final_cls = self._combine_classifications(keyword_analysis, tfidf_analysis, llm_analysis)
+
+        # Добавляем детали методов
+        final_cls["analysis_methods"] = {
             "keyword_matching": keyword_analysis is not None,
             "tfidf_similarity": tfidf_analysis is not None,
             "llm_classification": llm_analysis is not None
         }
-        
-        return final_classification
-    
+
+        # Сохраняем в metadata
+        context.metadata["topic_classification"] = final_cls
+
+        # Сохраняем в Redis-кэш с TTL (например, 3600 сек), если удалось соединение
+        if self.redis and cache_key:
+            try:
+                await self.redis.set(cache_key, json.dumps(final_cls, ensure_ascii=False), ex=3600)
+            except Exception as e:
+                self.logger.warning(f"TopicClassifierAgent: не удалось записать в Redis: {e}")
+
+        return final_cls
+
     def _analyze_keywords(self, question: str) -> Dict[str, Any]:
-        """Анализ на основе ключевых слов"""
-        question_lower = question.lower()
-        
+        """Анализ на основе ключевых слов."""
+        q_lower = question.lower()
         # Токенизация
         try:
-            tokens = word_tokenize(question_lower)
-            tokens = [token for token in tokens if token not in self.stop_words]
-        except:
-            tokens = question_lower.split()
-        
-        # Подсчет совпадений для каждой темы
-        topic_scores = {}
-        found_keywords = {}
-        
+            tokens = word_tokenize(q_lower)
+            tokens = [t for t in tokens if t not in self.stop_words]
+        except Exception:
+            tokens = q_lower.split()
+
+        topic_scores: Dict[str, int] = {}
+        found_keywords: Dict[str, List[str]] = {}
         for topic, keywords in self.topic_keywords.items():
-            matches = []
             score = 0
-            
-            for keyword in keywords:
-                # Точное совпадение
-                if keyword in question_lower:
-                    matches.append(keyword)
+            matches: List[str] = []
+            for kw in keywords:
+                if not kw:
+                    continue
+                # точное вхождение
+                if kw.lower() in q_lower:
                     score += 2
-                # Частичное совпадение
-                elif any(keyword in token for token in tokens):
-                    score += 1
-            
+                    matches.append(kw)
+                else:
+                    # частичное сравнение по токенам
+                    for token in tokens:
+                        if kw.lower() in token:
+                            score += 1
+                            break
             topic_scores[topic] = score
             if matches:
                 found_keywords[topic] = matches
-        
+
+        # Если нет совпадений
         if not topic_scores or max(topic_scores.values()) == 0:
             return {
                 "method": "keyword_matching",
                 "primary_topic": "general",
                 "confidence": 0.1,
+                "secondary_topics": [],
                 "topic_scores": topic_scores,
                 "found_keywords": found_keywords
             }
-        
-        # Определение основной темы
-        primary_topic = max(topic_scores.items(), key=lambda x: x[1])[0]
-        max_score = topic_scores[primary_topic]
-        
-        # Нормализация уверенности
-        total_keywords = sum(len(keywords) for keywords in self.topic_keywords.values())
-        confidence = min(max_score / 10, 1.0)  # Масштабирование
-        
-        # Вторичные темы
-        secondary_topics = [
-            topic for topic, score in sorted(topic_scores.items(), key=lambda x: x[1], reverse=True)[1:3]
-            if score > 0
-        ]
-        
+
+        # Выбираем основной по максимальному score
+        primary, max_score = max(topic_scores.items(), key=lambda x: x[1])
+        # Нормализация confidence: например, делим на некоторый порог, можно настроить
+        confidence = min(max_score / 10.0, 1.0)
+
+        # Вторичные темы: топ-2 после основной
+        sorted_topics = sorted(topic_scores.items(), key=lambda x: x[1], reverse=True)
+        secondary = []
+        for t, s in sorted_topics[1:3]:
+            if s > 0:
+                secondary.append(t)
         return {
             "method": "keyword_matching",
-            "primary_topic": primary_topic,
+            "primary_topic": primary,
             "confidence": confidence,
-            "secondary_topics": secondary_topics,
+            "secondary_topics": secondary,
             "topic_scores": topic_scores,
             "found_keywords": found_keywords
         }
-    
+
     def _analyze_tfidf(self, question: str) -> Optional[Dict[str, Any]]:
-        """Анализ на основе TF-IDF сходства"""
-        if not self.tfidf_vectorizer:
+        """Анализ на основе TF-IDF сходства с keyword corpus."""
+        if not self.tfidf_vectorizer or self.topic_vectors is None:
             return None
-        
         try:
-            # Векторизация вопроса
-            question_vector = self.tfidf_vectorizer.transform([question.lower()])
-            
-            # Вычисление сходства с каждой темой
-            similarities = cosine_similarity(question_vector, self.topic_vectors)[0]
-            
+            q_vec = self.tfidf_vectorizer.transform([question.lower()])
+            sims = cosine_similarity(q_vec, self.topic_vectors)[0]  # массив длины len(topic_names)
+            topic_sims = list(zip(self.topic_names, sims))
             # Сортировка по убыванию сходства
-            topic_similarities = list(zip(self.topic_names, similarities))
-            topic_similarities.sort(key=lambda x: x[1], reverse=True)
-            
-            primary_topic = topic_similarities[0][0]
-            confidence = topic_similarities[0][1]
-            
-            # Вторичные темы с достаточным сходством
-            secondary_topics = [
-                topic for topic, sim in topic_similarities[1:3]
-                if sim > 0.1
-            ]
-            
+            topic_sims.sort(key=lambda x: x[1], reverse=True)
+            primary, conf = topic_sims[0]
+            # Вторичные с порогом
+            secondary = [t for t, sim in topic_sims[1:3] if sim > 0.1]
+            # Словарь всех similarities для отладки, но может быть большим
+            sims_dict = {t: float(sim) for t, sim in topic_sims}
             return {
                 "method": "tfidf_similarity",
-                "primary_topic": primary_topic,
-                "confidence": float(confidence),
-                "secondary_topics": secondary_topics,
-                "similarities": dict(topic_similarities)
+                "primary_topic": primary,
+                "confidence": float(conf),
+                "secondary_topics": secondary,
+                "similarities": sims_dict
             }
-            
         except Exception as e:
-            self.logger.warning(f"Ошибка TF-IDF анализа: {e}")
+            self.logger.warning(f"TopicClassifierAgent: ошибка TF-IDF анализа: {e}")
             return None
-    
+
     async def _llm_classification(self, question: str, context: AgentContext) -> Optional[Dict[str, Any]]:
-        """Классификация с помощью LLM"""
+        """Классификация с помощью LLM."""
         try:
-            # Подготовка описания тем
-            topics_description = []
-            for topic_id, topic_info in self.topic_hierarchy.items():
-                topics_description.append(
-                    f"- {topic_id}: {topic_info['name']} (подтемы: {', '.join(topic_info['subtopics'][:5])})"
-                )
-            
+            # Формируем описание тем
+            topics_desc_lines: List[str] = []
+            for topic_id, info in self.topic_hierarchy.items():
+                name = info.get("name", topic_id)
+                subs = info.get("subtopics", [])
+                # Ограничиваем субтемы первым 5 для краткости
+                subs_str = ", ".join(subs[:5]) if isinstance(subs, list) else ""
+                topics_desc_lines.append(f"- {topic_id}: {name} (подтемы: {subs_str})")
+            topics_str = "\n".join(topics_desc_lines)
+
+            # Контекст: можно включить topic hints из предыдущей классификации или metadata
             context_str = ""
             if context.metadata:
-                context_str = str(context.metadata)
-            
+                prev = context.metadata.get("topic_classification")
+                if isinstance(prev, dict):
+                    # Можно включить прошлый результат кратко
+                    prev_primary = prev.get("primary_topic")
+                    context_str = f"Предыдущее определение темы: {prev_primary}"
+                else:
+                    # либо широкое содержание metadata
+                    context_str = json.dumps(context.metadata, ensure_ascii=False)
             prompt = self.classification_prompt.format(
                 question=question,
-                topics="\n".join(topics_description),
-                context=context_str
+                topics=topics_str,
+                context_str=context_str or "нет"
             )
-            
-            response = await asyncio.to_thread(self.llm.invoke, prompt)
-            
-            import json
-            try:
-                llm_result = json.loads(response)
-                llm_result["method"] = "llm_classification"
-                return llm_result
-            except json.JSONDecodeError:
-                self.logger.warning("Не удалось распарсить JSON ответ от LLM")
-                return None
-                
+            # Вызываем LLM через invoke_llm
+            response = await self.invoke_llm(prompt)
         except Exception as e:
-            self.logger.error(f"Ошибка LLM классификации: {e}")
+            self.logger.error(f"TopicClassifierAgent: ошибка при вызове LLM: {e}")
             return None
-    
-    def _combine_classifications(self, keyword_analysis: Dict, 
-                                tfidf_analysis: Optional[Dict], 
-                                llm_analysis: Optional[Dict]) -> Dict[str, Any]:
-        """Объединение результатов разных методов классификации"""
-        
-        # Веса для разных методов
+
+        parsed = self.parse_json_response(response.strip())
+        if not isinstance(parsed, dict):
+            self.logger.warning("TopicClassifierAgent: LLM вернул не JSON-объект")
+            return None
+
+        # Валидация структуры: ожидаемые поля: primary_topic, confidence, secondary_topics, reasoning, keywords_found, subtopic_hints
+        validated = {}
+        # primary_topic
+        pt = parsed.get("primary_topic")
+        if isinstance(pt, str) and pt in self.topic_hierarchy:
+            validated["primary_topic"] = pt
+        else:
+            # если неверно или отсутствует, оставляем None, объединение заполнит потом
+            validated["primary_topic"] = None
+        # confidence
+        conf = parsed.get("confidence")
+        if isinstance(conf, (int, float)):
+            try:
+                conf_f = float(conf)
+                validated["confidence"] = max(0.0, min(1.0, conf_f))
+            except:
+                validated["confidence"] = None
+        else:
+            validated["confidence"] = None
+        # secondary_topics
+        st = parsed.get("secondary_topics")
+        if isinstance(st, list):
+            # фильтруем строки, оставляем только валидные ключи
+            cleaned = [str(x) for x in st if isinstance(x, str) and x in self.topic_hierarchy and x != validated.get("primary_topic")]
+            validated["secondary_topics"] = cleaned[:3]
+        else:
+            validated["secondary_topics"] = []
+        # reasoning
+        reasoning = parsed.get("reasoning")
+        if isinstance(reasoning, str):
+            validated["reasoning"] = reasoning.strip()
+        else:
+            validated["reasoning"] = ""
+        # keywords_found
+        kf = parsed.get("keywords_found")
+        if isinstance(kf, list):
+            # строки
+            validated["keywords_found"] = [str(x) for x in kf if isinstance(x, str)]
+        else:
+            validated["keywords_found"] = []
+        # subtopic_hints
+        sh = parsed.get("subtopic_hints")
+        if isinstance(sh, list):
+            validated["subtopic_hints"] = [str(x) for x in sh if isinstance(x, str)]
+        else:
+            validated["subtopic_hints"] = []
+
+        validated["method"] = "llm_classification"
+        return validated
+
+    def _combine_classifications(
+        self,
+        keyword_analysis: Dict[str, Any],
+        tfidf_analysis: Optional[Dict[str, Any]],
+        llm_analysis: Optional[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """
+        Объединение результатов keyword-, TF-IDF- и LLM-анализов.
+        Возвращает финальную структуру с primary_topic, confidence, secondary_topics, reasoning, keywords_found, subtopic_hints, priority и topic_name.
+        """
+        # Веса можно брать из config или фиксировать
         weights = {
-            "keyword_matching": 0.4,
-            "tfidf_similarity": 0.3,
-            "llm_classification": 0.3
+            "keyword_matching": float(self.get_config("weight_keyword", 0.4)),
+            "tfidf_similarity": float(self.get_config("weight_tfidf", 0.3)),
+            "llm_classification": float(self.get_config("weight_llm", 0.3))
         }
-        
-        # Сбор всех предложенных тем
-        topic_votes = {}
-        analysis_details = {}
-        
-        # Обработка результатов ключевых слов
+        topic_votes: Dict[str, float] = {}
+        analysis_details: Dict[str, Any] = {}
+
+        # keyword
         if keyword_analysis:
-            primary = keyword_analysis["primary_topic"]
-            confidence = keyword_analysis["confidence"]
-            
-            topic_votes[primary] = topic_votes.get(primary, 0) + weights["keyword_matching"] * confidence
+            pt = keyword_analysis.get("primary_topic")
+            conf = keyword_analysis.get("confidence", 0.0)
+            if pt:
+                topic_votes[pt] = topic_votes.get(pt, 0.0) + weights["keyword_matching"] * conf
             analysis_details["keyword_analysis"] = keyword_analysis
-        
-        # Обработка TF-IDF результатов
+
+        # tfidf
         if tfidf_analysis:
-            primary = tfidf_analysis["primary_topic"]
-            confidence = tfidf_analysis["confidence"]
-            
-            topic_votes[primary] = topic_votes.get(primary, 0) + weights["tfidf_similarity"] * confidence
+            pt = tfidf_analysis.get("primary_topic")
+            conf = tfidf_analysis.get("confidence", 0.0)
+            if pt:
+                topic_votes[pt] = topic_votes.get(pt, 0.0) + weights["tfidf_similarity"] * conf
             analysis_details["tfidf_analysis"] = tfidf_analysis
-        
-        # Обработка LLM результатов
+
+        # llm
         if llm_analysis:
-            primary = llm_analysis["primary_topic"]
-            confidence = llm_analysis.get("confidence", 0.5)
-            
-            topic_votes[primary] = topic_votes.get(primary, 0) + weights["llm_classification"] * confidence
+            pt = llm_analysis.get("primary_topic")
+            conf = llm_analysis.get("confidence", 0.5) if llm_analysis.get("confidence") is not None else 0.5
+            if pt:
+                topic_votes[pt] = topic_votes.get(pt, 0.0) + weights["llm_classification"] * conf
             analysis_details["llm_analysis"] = llm_analysis
-        
-        # Определение финальной темы
+
+        # Если нет голосов, default to general
         if not topic_votes:
             final_topic = "general"
             final_confidence = 0.1
         else:
-            final_topic = max(topic_votes.items(), key=lambda x: x[1])[0]
-            final_confidence = min(topic_votes[final_topic], 1.0)
-        
-        # Сбор вторичных тем
-        secondary_topics = []
-        all_secondary = set()
-        
-        for analysis in [keyword_analysis, tfidf_analysis, llm_analysis]:
-            if analysis and "secondary_topics" in analysis:
-                all_secondary.update(analysis["secondary_topics"])
-        
-        secondary_topics = [topic for topic in all_secondary if topic != final_topic][:3]
-        
-        # Подтемы и ключевые слова
+            # Выбираем topic с max vote
+            final_topic, vote_score = max(topic_votes.items(), key=lambda x: x[1])
+            final_confidence = min(vote_score, 1.0)
+
+        # Secondary topics: собрать из всех анализов, исключив финальную тему
+        secondary_set = set()
+        for analysis in (keyword_analysis, tfidf_analysis, llm_analysis):
+            if isinstance(analysis, dict):
+                secs = analysis.get("secondary_topics") or []
+                for t in secs:
+                    if t != final_topic:
+                        secondary_set.add(t)
+        secondary_topics = list(secondary_set)[:3]
+
+        # Subtopic hints: по иерархии
         subtopic_hints = []
-        keywords_found = []
-        
         if final_topic in self.topic_hierarchy:
-            subtopic_hints = self.topic_hierarchy[final_topic]["subtopics"][:5]
-        
-        if keyword_analysis and "found_keywords" in keyword_analysis:
-            keywords_found = keyword_analysis["found_keywords"].get(final_topic, [])
-        
-        # Определение приоритета
-        priority = self.topic_hierarchy.get(final_topic, {}).get("priority", 4)
-        
+            subs = self.topic_hierarchy[final_topic].get("subtopics", [])
+            if isinstance(subs, list):
+                subtopic_hints = subs[:5]
+
+        # Keywords found: из keyword_analysis для финальной темы
+        keywords_found = []
+        if keyword_analysis:
+            found = keyword_analysis.get("found_keywords", {}).get(final_topic, [])
+            if isinstance(found, list):
+                keywords_found = [str(x) for x in found]
+
+        # Reasoning: объединяем reasoning из LLM, либо синтезируем
+        reasoning = ""
+        if llm_analysis and llm_analysis.get("reasoning"):
+            reasoning = llm_analysis["reasoning"]
+        else:
+            # Можно сформировать простое reasoning
+            reasoning = f"Выбрана тема '{final_topic}' на основе комбинации keyword- и TF-IDF-анализа"
+        # Priority & topic_name
+        priority = self.topic_hierarchy.get(final_topic, {}).get("priority", 5)
+        topic_name = self.topic_hierarchy.get(final_topic, {}).get("name", final_topic)
+
         return {
             "primary_topic": final_topic,
             "confidence": final_confidence,
             "secondary_topics": secondary_topics,
-            "priority": priority,
-            "topic_name": self.topic_hierarchy.get(final_topic, {}).get("name", final_topic),
-            "subtopic_hints": subtopic_hints,
+            "reasoning": reasoning,
             "keywords_found": keywords_found,
+            "subtopic_hints": subtopic_hints,
+            "topic_name": topic_name,
+            "priority": priority,
             "topic_votes": topic_votes,
-            "analysis_details": analysis_details,
-            "reasoning": f"Классификация на основе {len([a for a in [keyword_analysis, tfidf_analysis, llm_analysis] if a])} методов"
+            "analysis_details": analysis_details
         }
-    
-    def _calculate_confidence(self, result_data: Any, context: AgentContext) -> float:
-        """Расчет уверенности в классификации"""
-        if not result_data:
-            return 0.0
-        
-        base_confidence = result_data.get("confidence", 0.0)
-        
-        # Бонус за согласованность методов
-        analysis_details = result_data.get("analysis_details", {})
-        methods_count = len(analysis_details)
-        
-        if methods_count > 1:
-            # Проверка согласованности
-            primary_topics = set()
-            for analysis in analysis_details.values():
-                if "primary_topic" in analysis:
-                    primary_topics.add(analysis["primary_topic"])
-            
-            if len(primary_topics) == 1:  # Все методы согласны
-                base_confidence = min(base_confidence + 0.2, 1.0)
-            elif len(primary_topics) <= 2:  # Частичное согласие
-                base_confidence = min(base_confidence + 0.1, 1.0)
-        
-        # Учет приоритета темы
-        priority = result_data.get("priority", 4)
-        priority_bonus = (5 - priority) * 0.05
-        
-        return min(base_confidence + priority_bonus, 1.0)
 
-# Фабрика для создания агента
-def create_topic_classifier_agent(config: Dict[str, Any] = None, 
-                                 langfuse_client=None) -> TopicClassifierAgent:
-    """Фабричная функция для создания агента классификации тем"""
+    def _calculate_confidence(self, result_data: Any, context: AgentContext) -> float:
+        """Расчёт уверенности: используем result_data["confidence"], с бонусом, если методы согласуются."""
+        if not isinstance(result_data, dict):
+            return 0.0
+        base = result_data.get("confidence", 0.0)
+        details = result_data.get("analysis_details", {})
+        # бонус за согласованность: если keyword и tfidf и llm выбрали одну тему, +0.1
+        topics = []
+        for m in ("keyword_analysis", "tfidf_analysis", "llm_analysis"):
+            part = details.get(m)
+            if isinstance(part, dict) and part.get("primary_topic"):
+                topics.append(part.get("primary_topic"))
+        if topics and len(set(topics)) == 1:
+            base = min(base + 0.1, 1.0)
+        return max(0.0, min(1.0, float(base)))
+
+    async def _postprocess(self, result_data: Dict[str, Any], context: AgentContext) -> Dict[str, Any]:
+        """
+        Сохраняем результат в metadata, чтобы другие агенты могли использовать:
+        context.metadata['topic_classification'] = result_data
+        """
+        context.metadata["topic_classification"] = result_data
+        return result_data
+
+
+def create_topic_classifier_agent(config: Dict[str, Any] = None, langfuse_client=None) -> TopicClassifierAgent:
+    """
+    Фабричная функция для создания TopicClassifierAgent.
+    config может содержать:
+      - model_name, temperature, ollama_base_url
+      - topic_hierarchy (dict), topic_keywords (dict)
+      - weight_keyword, weight_tfidf, weight_llm
+    """
     default_config = {
-        "model_name": "llama3.1:8b",
+        "model_name": settings.LLM_MODEL_NAME,
         "temperature": 0.1,
-        "ollama_base_url": "http://localhost:11434",
-        "use_tfidf": True,
-        "use_keywords": True,
-        "use_llm": True,
-        "min_confidence_threshold": 0.3
+        "ollama_base_url": str(settings.LLM_BASE_URL),
+        # веса для объединения
+        "weight_keyword": 0.4,
+        "weight_tfidf": 0.3,
+        "weight_llm": 0.3,
+        # topic_hierarchy и topic_keywords при отсутствии будут использованы дефолтные из класса
     }
-    
     if config:
         default_config.update(config)
-    
     return TopicClassifierAgent(default_config, langfuse_client)

@@ -1,0 +1,50 @@
+version: '3.8'
+services:
+  mcp-server:
+    build:
+      context: .
+      dockerfile: deployment/Dockerfile
+    container_name: ai_docs_mcp
+    environment:
+      - FASTAPI_ENV=production
+      - POSTGRES_URL=postgresql+asyncpg://user:password@postgres:5432/ai_docs_db
+      - REDIS_URL=redis://redis:6379/0
+      - QDRANT_URL=http://qdrant:6333
+      - EMBEDDING_MODEL_NAME=sentence-transformers/all-MiniLM-L6-v2
+    ports:
+      - "8000:8000"
+    depends_on:
+      - redis
+      - postgres
+      - qdrant
+    restart: always
+
+  redis:
+    image: redis:7-alpine
+    container_name: ai_docs_redis
+    ports:
+      - "6379:6379"
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: ai_docs_postgres
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: ai_docs_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: ai_docs_qdrant
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+volumes:
+  pgdata:
+  qdrant_data:

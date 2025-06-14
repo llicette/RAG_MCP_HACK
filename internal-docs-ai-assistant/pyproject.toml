@@ -6,6 +6,9 @@ authors = ["Skillet323 <mr.borgachev@gmail.com>"]
 packages = [
   { include = "agents", from = "src" },
   { include = "core", from = "src" },
+  { include = "utils", from = "src" },
+  { include = "mcp", from = "src" },
+  { include = "configs", from = "src" },
 ]
 
 [tool.poetry.dependencies]
@@ -28,6 +31,13 @@ langgraph = "^0.4.8"
 langchain-community = "^0.3.25"
 langchain-huggingface = "^0.3.0"
 langchain-chroma = "^0.2.4"
+uvicorn = {extras = ["standard"], version = "^0.34.3"}
+pydantic = "^2.11.7"
+sqlalchemy = {extras = ["asyncio"], version = "^2.0.41"}
+asyncpg = "^0.30.0"
+redis = {extras = ["async"], version = "^6.2.0"}
+python-dotenv = "^1.1.0"
+psycopg2-binary = "^2.9.10"
 
 [tool.poetry.dev-dependencies]
 pytest = "*"

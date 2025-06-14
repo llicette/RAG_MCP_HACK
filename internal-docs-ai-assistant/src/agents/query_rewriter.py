@@ -1,36 +1,36 @@
-"""
-Agent для переписывания и улучшения поисковых запросов
-"""
 import re
 import json
 import asyncio
-from typing import Dict, Any, List, Optional
-from langchain.llms import Ollama
-from langchain.prompts import PromptTemplate
-
+from typing import Dict, Any, List
 from agents.base_agent import BaseAgent, AgentContext, with_retry, with_timeout
+from langchain_community.llms import Ollama  # Или from langchain.llms import Ollama, если требуется
+from langchain.prompts import PromptTemplate
+from configs.settings import settings  # путь к settings, скорректируйте при необходимости
+
 
 class QueryRewriterAgent(BaseAgent):
     """Агент для переписывания запросов для лучшего поиска"""
-    
+
     def __init__(self, config: Dict[str, Any], langfuse_client=None):
         super().__init__("query_rewriter", config, langfuse_client)
-        
-        self.llm = Ollama(
-            model=self.get_config("model_name", "llama3.1:8b"),
-            temperature=self.get_config("temperature", 0.2),
-            base_url=self.get_config("ollama_base_url", "http://localhost:11434")
-        )
-        
+
+        # Настройка LLM через Ollama
+        model_name = self.get_config("model_name", settings.LLM_MODEL_NAME)
+        base_url = self.get_config("ollama_base_url", None) or str(settings.LLM_BASE_URL)
+        temperature = float(self.get_config("temperature", 0.1))
+        self.llm = Ollama(model=model_name, temperature=temperature, base_url=base_url)
+
+        # PromptTemplate: экранируем фигурные скобки {{ }} для JSON-образца
+        prompt_template_str = self._get_prompt_template()
         self.prompt_template = PromptTemplate(
-            input_variables=["original_query", "context", "critic_analysis"],
-            template=self._get_prompt_template()
+            input_variables=["original_query", "context_str", "critic_analysis"],
+            template=prompt_template_str
         )
-        
-        # Словарь сокращений и их расшифровок
+
+        # Словарь сокращений -> полные формы
         self.abbreviations = {
             "тз": "техническое задание",
-            "кр": "код ревью", 
+            "кр": "код ревью",
             "пр": "пулл реквест",
             "дб": "база данных",
             "апи": "API",
@@ -47,8 +47,8 @@ class QueryRewriterAgent(BaseAgent):
             "бранч": "ветка",
             "релиз": "release"
         }
-        
-        # Синонимы для расширения поиска
+
+        # Синонимы для альтернативных запросов
         self.synonyms = {
             "ошибка": ["баг", "проблема", "неисправность", "дефект"],
             "инструкция": ["руководство", "гайд", "мануал", "как сделать"],
@@ -58,18 +58,19 @@ class QueryRewriterAgent(BaseAgent):
             "безопасность": ["секьюрити", "защита", "авторизация"],
             "производительность": ["перформанс", "скорость", "оптимизация"]
         }
-    
+
     def _get_prompt_template(self) -> str:
-        """Получение шаблона промпта для переписывания запросов"""
-        return """Ты - эксперт по оптимизации поисковых запросов для системы внутренней документации.
+        """Шаблон PromptTemplate для переписывания запросов."""
+        # Экранируем JSON-образец двойными {{ }}
+        return """Ты — эксперт по оптимизации поисковых запросов для системы внутренней документации.
 
 Оригинальный запрос пользователя: "{original_query}"
 
-Анализ критика вопросов: {critic_analysis}
+Критический анализ запроса (если имеется): {critic_analysis}
 
-Контекст: {context}
+Контекст (например, тема или предыдущий ответ): {context_str}
 
-Твоя задача - переписать запрос для лучшего поиска по документации, учитывая:
+Твоя задача — переписать запрос для лучшего поиска по документации, учитывая:
 1. Расширение сокращений
 2. Добавление синонимов
 3. Декомпозицию сложных запросов
@@ -80,117 +81,161 @@ class QueryRewriterAgent(BaseAgent):
 
 {{
   "rewritten_query": "основной улучшенный запрос",
-  "alternative_queries": [
-    "альтернативный запрос 1",
-    "альтернативный запрос 2",
-    "альтернативный запрос 3"
-  ],
-  "search_keywords": [
-    "ключевое слово 1",
-    "ключевое слово 2",
-    "ключевое слово 3"
-  ],
-  "expanded_terms": {{
-    "оригинальный_термин": "расширенный_термин"
-  }},
+  "alternative_queries": ["альтернативный запрос 1", "альтернативный запрос 2", "альтернативный запрос 3"],
+  "search_keywords": ["ключевое слово 1", "ключевое слово 2", "ключевое слово 3"],
+  "expanded_terms": {{"оригинальный_термин": "расширенный_термин"}},
   "query_type": "factual|procedural|troubleshooting|conceptual",
   "search_strategy": "semantic|keyword|hybrid",
-  "filters": {{
-    "document_types": ["тип1", "тип2"],
-    "topics": ["тема1", "тема2"],
-    "departments": ["отдел1", "отдел2"]
-  }},
-  "decomposed_queries": [
-    "подзапрос 1",
-    "подзапрос 2"
-  ],
-  "confidence": 0.0-1.0,
-  "improvements_made": [
-    "описание улучшения 1",
-    "описание улучшения 2"
-  ]
+  "filters": {{"document_types": ["тип1", "тип2"], "topics": ["тема1", "тема2"], "departments": ["отдел1", "отдел2"]}},
+  "decomposed_queries": ["подзапрос 1", "подзапрос 2"],
+  "confidence": 0.0,
+  "improvements_made": ["описание улучшения 1", "описание улучшения 2"]
 }}
 
-Отвечай только валидным JSON."""
+Отвечай только валидным JSON без дополнительного текста."""
     
-    @with_timeout(120.0)
+    @with_timeout(60.0)
     @with_retry(max_attempts=2)
     async def _process(self, context: AgentContext) -> Dict[str, Any]:
-        """Основная логика переписывания запроса"""
+        """
+        Основная логика переписывания запроса.
+        """
+        # Оригинальный запрос: processed_query или original_query
         original_query = context.processed_query or context.original_query or ""
-        
-        # Предварительная обработка
-        preprocessed = self._preprocess_query(original_query)
-        
-        # Анализ критика (если есть)
+        # Предварительная обработка: расширение сокращений и прочее
+        preprocessed_query = self._preprocess_query(original_query)
+
+        # Извлечь критический анализ из context.metadata, если был записан QuestionCriticAgent
         critic_analysis = self._extract_critic_analysis(context)
-        
-        # Переписывание с помощью LLM
-        llm_result = await self._llm_rewrite(preprocessed, context, critic_analysis)
-        
-        # Постобработка и валидация
-        final_result = self._postprocess_result(llm_result, preprocessed, context)
-        
+
+        # Формируем контекст: например, тема из context.topic и/или краткое содержание контекста
+        context_str = self._build_context_str(context)
+
+        # Вызов LLM для переписывания
+        llm_result = await self._llm_rewrite(preprocessed_query, context_str, original_query, critic_analysis)
+
+        # Постобработка: заполнение обязательных полей, добавление расширенных терминов, альтернативных запросов и т.д.
+        final_result = self._postprocess_result(llm_result, original_query, preprocessed_query, context)
+
         return final_result
 
     def _preprocess_query(self, query: str) -> str:
-        """Предварительная обработка запроса: расширение сокращений"""
+        """
+        Предварительная обработка: расширение сокращений, нормализация пробелов.
+        """
+        q = query
         # Расширение сокращений
         for abbr, full in self.abbreviations.items():
-            query = re.sub(r'\b' + re.escape(abbr) + r'\b', full, query, flags=re.IGNORECASE)
-        
-        # Добавление пробелов вокруг специальных символов
-        query = re.sub(r'([/-])', r' \1 ', query)
-        
-        return query.strip()
+            # Замена целиком слова, игнорируя регистр
+            q = re.sub(r'\b' + re.escape(abbr) + r'\b', full, q, flags=re.IGNORECASE)
+        # Добавление пробелов вокруг специальных символов для лучшей токенизации
+        q = re.sub(r'([/-])', r' \1 ', q)
+        return q.strip()
 
     def _extract_critic_analysis(self, context: AgentContext) -> str:
-        """Извлечение анализа критика из контекста"""
-        if hasattr(context, 'critic_analysis'):
-            return context.critic_analysis
-        return "Нет критического анализа предыдущих запросов."
+        """
+        Попытка извлечь результат QuestionCriticAgent или другие подсказки из metadata.
+        Например, context.metadata["critic_analysis"] или context.metadata["quality_hints"].
+        """
+        # Пример: если в metadata сохранили под ключом "critic_analysis"
+        critic = context.metadata.get("critic_analysis")
+        if isinstance(critic, str) and critic.strip():
+            return critic.strip()
+        # Возможно, QuestionCriticAgent сохранил информацию в context.metadata["agent_results"]["question_critic"]
+        ar = context.metadata.get("agent_results")
+        if isinstance(ar, dict):
+            qc = ar.get("question_critic")
+            if isinstance(qc, dict):
+                # Попытаемся взять текстовое поле из анализа
+                text = qc.get("analysis") or qc.get("reasoning") or qc.get("feedback")
+                if isinstance(text, str) and text.strip():
+                    return text.strip()
+        # Нет анализа
+        return "Нет критического анализа предыдущего запроса."
 
-    async def _llm_rewrite(self, preprocessed: str, context: AgentContext, 
-                          critic_analysis: str) -> Dict[str, Any]:
-        """Переписывание запроса с помощью LLM"""
+    def _build_context_str(self, context: AgentContext) -> str:
+        """
+        Формирует строку контекста: можно взять topic, краткий summary предыдущих ответов или metadata.
+        """
+        parts: List[str] = []
+        # Тема из классификатора
+        if context.topic:
+            parts.append(f"Тема: {context.topic}")
+        # Если есть обогащённый контекст из ContextEnricherAgent
+        enriched = context.metadata.get("enriched_context")
+        if isinstance(enriched, dict) and enriched:
+            # Берём ключи, формируем короткую строку
+            try:
+                enriched_str = json.dumps(enriched, ensure_ascii=False)
+            except:
+                enriched_str = str(enriched)
+            parts.append(f"Обогащённый контекст: {enriched_str}")
+        # Если есть последний ответ, можно добавить кратко
+        last_answer = context.metadata.get("answer_text") or context.metadata.get("final_answer")
+        if isinstance(last_answer, str) and last_answer.strip():
+            snippet = last_answer.strip().replace("\n", " ")
+            snippet = snippet[:200]
+            parts.append(f"Последний ответ: {snippet}")
+        # Объединяем
+        if parts:
+            return " | ".join(parts)
+        else:
+            return "Нет дополнительного контекста."
+
+    async def _llm_rewrite(self, preprocessed_query: str, context_str: str, original_query: str, critic_analysis: str) -> Dict[str, Any]:
+        """
+        Вызов LLM для переписывания запроса.
+        """
         try:
             prompt = self.prompt_template.format(
-                original_query=context.original_query,
-                context = context.metadata.get("context") or context.topic or "Нет контекста",
+                original_query=original_query,
+                context_str=context_str,
                 critic_analysis=critic_analysis
             )
-            
-            response = await self.llm.apredict(prompt)
-            
-            # Попытка преобразовать ответ в JSON
-            try:
-                result = json.loads(response.strip())
-            except json.JSONDecodeError:
-                # Логирование ошибки парсинга
-                self.logger.error(f"LLM вернул невалидный JSON: {response}")
-                result = {
-                    "rewritten_query": preprocessed,
-                    "improvements_made": ["Не удалось получить ответ от LLM, использован предварительный запрос"],
-                    "confidence": 0.6
-                }
-            
-            return result
-            
+            # Вызываем LLM через invoke_llm (retry + timeout)
+            response = await self.invoke_llm(prompt)
         except Exception as e:
-            # Обработка ошибок LLM
-            self.logger.error(f"Ошибка при вызове LLM: {e}")
+            self.logger.error(f"QueryRewriterAgent: ошибка при вызове LLM: {e}")
+            # Возвращаем минимальный результат
             return {
-                "rewritten_query": preprocessed,
-                "improvements_made": ["Ошибка LLM, использован предварительный запрос"],
-                "confidence": 0.5
+                "rewritten_query": preprocessed_query,
+                "alternative_queries": [],
+                "search_keywords": [],
+                "expanded_terms": {},
+                "query_type": "factual",
+                "search_strategy": "hybrid",
+                "filters": {"document_types": [], "topics": [], "departments": []},
+                "decomposed_queries": [],
+                "confidence": 0.5,
+                "improvements_made": ["Ошибка LLM, использован предварительный запрос"]
             }
 
-    def _postprocess_result(self, result: Dict[str, Any], 
-                           preprocessed: str, context: AgentContext) -> Dict[str, Any]:
-        """Постобработка и валидация результатов"""
-        # Гарантия наличия всех необходимных полей
+        # Парсим JSON-ответ
+        parsed = self.parse_json_response(response.strip())
+        if not isinstance(parsed, dict):
+            # Логируем проблему
+            self.logger.warning(f"QueryRewriterAgent: LLM вернул не JSON-объект: {response}")
+            return {
+                "rewritten_query": preprocessed_query,
+                "alternative_queries": [],
+                "search_keywords": [],
+                "expanded_terms": {},
+                "query_type": "factual",
+                "search_strategy": "hybrid",
+                "filters": {"document_types": [], "topics": [], "departments": []},
+                "decomposed_queries": [],
+                "confidence": 0.6,
+                "improvements_made": ["Не удалось распознать JSON от LLM, использован предварительный запрос"]
+            }
+        return parsed
+
+    def _postprocess_result(self, result: Dict[str, Any], original_query: str, preprocessed_query: str, context: AgentContext) -> Dict[str, Any]:
+        """
+        Заполнение обязательных полей, удаление дубликатов, добавление расширенных терминов и альтернативных запросов.
+        """
+        # Определяем набор обязательных полей с дефолтными значениями
         required_fields = {
-            "rewritten_query": preprocessed,
+            "rewritten_query": preprocessed_query,
             "alternative_queries": [],
             "search_keywords": [],
             "expanded_terms": {},
@@ -201,90 +246,204 @@ class QueryRewriterAgent(BaseAgent):
             "confidence": 0.7,
             "improvements_made": ["Базовое переписывание запроса"]
         }
-        
-        # Заполнение отсутствующих полей
+        # Заполняем отсутствующие поля дефолтами
         for field, default in required_fields.items():
-            if field not in result:
+            if field not in result or result[field] is None:
                 result[field] = default
-        
-        # Добавление расширенных терминов
-        result["expanded_terms"].update(self._extract_expanded_terms(context.original_query, preprocessed))
-        
-        # Добавление синонимов в альтернативные запросы
-        synonyms_queries = self._generate_alternative_queries(context.original_query)
-        result["alternative_queries"].extend(synonyms_queries)
-        
-        # Удаление дубликатов в альтернативных запросах
-        result["alternative_queries"] = list(dict.fromkeys(result["alternative_queries"]))
-        
-        # Определение типа запроса, если не указан
-        if result["query_type"] == "factual":
-            result["query_type"] = self._determine_query_type(context.original_query)
-        
-        # Добавление ключевых слов из оригинального запроса
+        # Приведение типов: 
+        # rewritten_query
+        if not isinstance(result["rewritten_query"], str) or not result["rewritten_query"].strip():
+            result["rewritten_query"] = preprocessed_query
+        # alternative_queries: список строк
+        if isinstance(result.get("alternative_queries"), list):
+            alt = []
+            for x in result["alternative_queries"]:
+                if isinstance(x, str) and x.strip():
+                    alt.append(x.strip())
+            result["alternative_queries"] = alt
+        else:
+            result["alternative_queries"] = []
+        # search_keywords: список строк
+        if isinstance(result.get("search_keywords"), list):
+            kws = []
+            for x in result["search_keywords"]:
+                if isinstance(x, str) and x.strip():
+                    kws.append(x.strip())
+            result["search_keywords"] = kws
+        else:
+            result["search_keywords"] = []
+        # expanded_terms: dict str->str
+        if isinstance(result.get("expanded_terms"), dict):
+            et = {}
+            for k, v in result["expanded_terms"].items():
+                if isinstance(k, str) and isinstance(v, str):
+                    et[k] = v
+            result["expanded_terms"] = et
+        else:
+            result["expanded_terms"] = {}
+        # query_type
+        qt = result.get("query_type")
+        if not isinstance(qt, str) or qt not in {"factual", "procedural", "troubleshooting", "conceptual"}:
+            result["query_type"] = self._determine_query_type(original_query)
+        # search_strategy
+        ss = result.get("search_strategy")
+        if not isinstance(ss, str) or ss not in {"semantic", "keyword", "hybrid"}:
+            result["search_strategy"] = "hybrid"
+        # filters
+        fl = result.get("filters")
+        if not isinstance(fl, dict):
+            result["filters"] = {"document_types": [], "topics": [], "departments": []}
+        else:
+            # Убедимся, что внутри списки
+            dt = fl.get("document_types")
+            tp = fl.get("topics")
+            dp = fl.get("departments")
+            result["filters"] = {
+                "document_types": dt if isinstance(dt, list) else [],
+                "topics": tp if isinstance(tp, list) else [],
+                "departments": dp if isinstance(dp, list) else []
+            }
+        # decomposed_queries: список строк
+        dq = result.get("decomposed_queries")
+        if isinstance(dq, list):
+            dq_list = []
+            for x in dq:
+                if isinstance(x, str) and x.strip():
+                    dq_list.append(x.strip())
+            result["decomposed_queries"] = dq_list
+        else:
+            result["decomposed_queries"] = []
+        # confidence
+        conf = result.get("confidence")
+        if isinstance(conf, (int, float)):
+            try:
+                conf_f = float(conf)
+                result["confidence"] = max(0.0, min(1.0, conf_f))
+            except:
+                result["confidence"] = 0.7
+        else:
+            result["confidence"] = 0.7
+        # improvements_made: список строк
+        im = result.get("improvements_made")
+        if isinstance(im, list):
+            imp = []
+            for x in im:
+                if isinstance(x, str) and x.strip():
+                    imp.append(x.strip())
+            result["improvements_made"] = imp if imp else ["Базовое переписывание запроса"]
+        else:
+            result["improvements_made"] = ["Базовое переписывание запроса"]
+
+        # Добавляем расширенные термины на основании сокращений
+        expanded = self._extract_expanded_terms(original_query, preprocessed_query)
+        # Объединяем с тем, что пришло
+        result["expanded_terms"].update(expanded)
+
+        # Добавляем альтернативные запросы на основании синонимов
+        alt_syns = self._generate_alternative_queries(original_query)
+        # Добавляем, удаляем дубликаты
+        combined_alts = result["alternative_queries"] + alt_syns
+        # Убираем точные дубли, сохраняя порядок
+        seen = set()
+        deduped = []
+        for q in combined_alts:
+            if q not in seen:
+                seen.add(q)
+                deduped.append(q)
+        result["alternative_queries"] = deduped
+
+        # Если нет search_keywords, извлечём простые ключевые слова из оригинала
         if not result["search_keywords"]:
-            result["search_keywords"] = self._extract_keywords(context.original_query)
-        
+            result["search_keywords"] = self._extract_keywords(original_query)
+
+        # Сохраняем итог в metadata, чтобы другие агенты могли использовать
+        context.metadata["rewritten_query_result"] = result
+
         return result
 
     def _extract_expanded_terms(self, original: str, preprocessed: str) -> Dict[str, str]:
-        """Извлечение расширенных терминов из запроса"""
-        expanded = {}
+        """
+        Проверяем, какие сокращения были расширены: если аббревиатура есть в original, 
+        и её полная форма есть в preprocessed, добавляем в expanded_terms.
+        """
+        expanded: Dict[str, str] = {}
         for abbr, full in self.abbreviations.items():
-            if re.search(r'\b' + re.escape(abbr) + r'\b', original, re.IGNORECASE):
-                if full.lower() in preprocessed.lower():
+            # Если аббревиатура встречается как слово в original
+            if re.search(r'\b' + re.escape(abbr) + r'\b', original, flags=re.IGNORECASE):
+                # И полная форма присутствует в preprocessed
+                if re.search(r'\b' + re.escape(full.lower()) + r'\b', preprocessed.lower()):
                     expanded[abbr] = full
         return expanded
 
     def _generate_alternative_queries(self, query: str) -> List[str]:
-        """Генерация альтернативных запросов на основе синонимов"""
-        alternatives = []
-        query_lower = query.lower()
-        
+        """
+        Генерация альтернативных запросов на основе словаря синонимов.
+        """
+        alternatives: List[str] = []
+        q_lower = query.lower()
         for keyword, syns in self.synonyms.items():
-            if keyword in query_lower:
+            if re.search(r'\b' + re.escape(keyword) + r'\b', q_lower):
                 for syn in syns:
-                    # Замена с сохранением регистра
-                    pattern = re.compile(r'\b' + re.escape(keyword) + r'\b', re.IGNORECASE)
-                    alt = pattern.sub(syn, query)
-                    alternatives.append(alt)
-        
-        return list(set(alternatives))
+                    # Заменяем keyword на synonym, сохраняя регистр первой буквы
+                    def replace_func(match):
+                        word = match.group(0)
+                        # Сохраним регистр: если первая буква была заглавной, делаем syn с заглавной
+                        if word[0].isupper():
+                            return syn.capitalize()
+                        else:
+                            return syn
+                    pattern = re.compile(r'\b' + re.escape(keyword) + r'\b', flags=re.IGNORECASE)
+                    alt = pattern.sub(replace_func, query)
+                    if alt and alt != query:
+                        alternatives.append(alt)
+        return alternatives
 
     def _determine_query_type(self, query: str) -> str:
-        """Определение типа запроса"""
-        query_lower = query.lower()
-        
-        if any(word in query_lower for word in ["как", "инструкция", "руководство", "сделать"]):
+        """
+        Простейшее определение типа запроса по ключевым словам.
+        """
+        ql = query.lower()
+        if any(w in ql for w in ["как", "инструкция", "руководство", "сделать", "настроить"]):
             return "procedural"
-        elif any(word in query_lower for word in ["ошибка", "не работает", "проблема", "баг"]):
+        if any(w in ql for w in ["ошибка", "не работает", "проблема", "баг", "исправить"]):
             return "troubleshooting"
-        elif any(word in query_lower for word in ["что такое", "описание", "что это", "концепция"]):
+        if any(w in ql for w in ["что такое", "описание", "что это", "концепция", "понятие"]):
             return "conceptual"
-        else:
-            return "factual"
+        return "factual"
 
     def _extract_keywords(self, query: str) -> List[str]:
-        """Извлечение ключевых слов из запроса"""
-        # Простая реализация - разбиение на слова и удаление стоп-слов
-        stop_words = {"как", "где", "когда", "почему", "что", "это", "на", "в", "и", "или", "не"}
+        """
+        Простая экстракция ключевых слов: разбиваем на слова, удаляем короткие и стоп-слова.
+        """
+        # Можно расширить стоп-слова, брать из nltk, но здесь простой набор
+        stop_words = {"как", "где", "когда", "почему", "что", "это", "на", "в", "и", "или", "не", "для", "по"}
         words = re.findall(r'\b\w+\b', query.lower())
-        return [word for word in words if word not in stop_words]
-    
-# Фабрика для создания агента
-def create_query_rewriter_agent(config: Dict[str, Any] = None, 
-                                langfuse_client=None) -> QueryRewriterAgent:
-    """Фабричная функция для создания агента переписывания запросов"""
+        keywords = []
+        for w in words:
+            if len(w) <= 2:
+                continue
+            if w in stop_words:
+                continue
+            keywords.append(w)
+        # Убираем дубликаты, сохраняя порядок
+        seen = set()
+        uniq = []
+        for w in keywords:
+            if w not in seen:
+                seen.add(w)
+                uniq.append(w)
+        return uniq
+
+
+def create_query_rewriter_agent(config: Dict[str, Any] = None, langfuse_client=None) -> QueryRewriterAgent:
+    """
+    Фабричная функция для создания экземпляра QueryRewriterAgent.
+    """
     default_config = {
-        "model_name": "llama3.1:8b",
-        "temperature": 0.3,
-        "ollama_base_url": "http://localhost:11434",
-        "max_analysis_time": 15.0,
-        "enable_pattern_analysis": True,
-        "enable_llm_analysis": True
+        "model_name": settings.LLM_MODEL_NAME,
+        "temperature": 0.1,
+        "ollama_base_url": str(settings.LLM_BASE_URL)
     }
-    
     if config:
         default_config.update(config)
-    
     return QueryRewriterAgent(default_config, langfuse_client)
