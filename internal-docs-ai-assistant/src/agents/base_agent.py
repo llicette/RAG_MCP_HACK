@@ -106,7 +106,8 @@ class BaseAgent(ABC):
                     self.logger.error(f"LLM call permanently failed after {attempt} attempts: {e}")
         # Если все неудачны
         raise last_exc
-
+    async def execute(self, context: AgentContext) -> AgentResult:
+        return await self.run(context)
     def parse_json_response(self, response: str) -> Dict[str, Any]:
         try:
             parsed = json.loads(response)
