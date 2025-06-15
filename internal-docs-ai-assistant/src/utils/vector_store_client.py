@@ -43,8 +43,14 @@ class VectorStoreClient:
             try:
                 from qdrant_client import QdrantClient
                 from sentence_transformers import SentenceTransformer
+                QDRANT_URL = os.getenv('QDRANT_URL')
+                QDRANT_API_KEY = os.getenv('QDRANT_API_KEY', None)
                 url = self.config.get("qdrant_url") or os.getenv("QDRANT_URL")
-                self.qdrant = QdrantClient(url=url)
+                self.qdrant = QdrantClient(
+                    url=QDRANT_URL,
+                    api_key=QDRANT_API_KEY,
+                    prefer_grpc=False
+                )
                 embedding_model = self.config.get("embedding_model_name") or os.getenv("EMBEDDING_MODEL_NAME")
                 self.embedder = SentenceTransformer(embedding_model)
                 self.collection_name = self.config.get("collection_name", "documents")

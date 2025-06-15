@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     CHROMA_SERVER_PORT: int | None = Field(None, env="CHROMA_SERVER_PORT")
     EMBEDDING_MODEL_NAME: str = Field("sentence-transformers/all-MiniLM-L6-v2", env="EMBEDDING_MODEL_NAME")
     QDRANT_URL: AnyUrl = Field("http://qdrant:6333", env="QDRANT_URL")
-
+    POSTGRES_URL: AnyUrl = Field("POSTGRES_URL=postgresql+asyncpg://user:password@localhost:5433/ai_docs_db", env="POSTGRES_URL")
     # MCP
     MCP_BASE_URL: AnyUrl = Field("http://mcp-server:8000", env="MCP_BASE_URL")
 

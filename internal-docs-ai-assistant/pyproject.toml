@@ -39,6 +39,7 @@ redis = {extras = ["async"], version = "^6.2.0"}
 python-dotenv = "^1.1.0"
 psycopg2-binary = "^2.9.10"
 httpx = "^0.28.1"
+prometheus-client = "^0.22.1"
 
 [tool.poetry.dev-dependencies]
 pytest = "*"
